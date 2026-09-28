@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Noorio Wall",
+  "version": "1.0",
+  "description": "One tab showing every Noorio camera at once. Click the toolbar button to open the wall.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://webclient.noorio.com/*"
+      ],
+      "js": [
+        "logo.js",
+        "avatars.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open Noorio Wall",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "permissions": [
+    "tabs"
+  ]
+}

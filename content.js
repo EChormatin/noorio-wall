@@ -1,0 +1,661 @@
+// Noorio Wall: one page showing every camera, built on top of webclient.noorio.com itself.
+//
+// Same-origin is the whole trick: the frames share your login, and this script can reach inside them to
+// pick a camera, find the video, and crop the frame to it. A grid served from disk gets four login screens.
+//
+// All cameras start at once. A tile that has not started within START_TIMEOUT_MS reloads itself and tries
+// again, because a camera that loses the race on one attempt usually wins on the next.
+
+const AUTO_DISCOVER = true;       // read the camera list from Noorio in the background and rebuild if it differs
+const SIDEBAR_HEADING = "All devices";   // the sidebar heading the discovery anchors on
+const FALLBACK_CAMS = ["Olivia", "Benjamin", "Olivia (Liquids)", "Benjamin (Liquids)"];  // used only if discovery fails
+const FRAME_W = 1500;             // internal width each frame renders at before cropping
+const FRAME_H = 950;              // internal height each frame renders at before cropping
+const FIT = "cover";              // "cover" fills the tile and crops, "contain" letterboxes
+const START_TIMEOUT_MS = 40000;   // reload a tile that has not started within this, retries often succeed
+const STALL_SECONDS = 60;         // reload a live tile if its clock stops advancing this long
+const STALL_GRACE_MS = 25000;     // ignore stall checks this long after a frame loads
+const RELOAD_MINUTES = 0;         // periodic refresh per tile, 0 disables. Sequential start makes this risky, leave off unless needed
+const RELOAD_COOLDOWN_MS = 45000; // never reload the same tile more often than this
+const PLAY_CLICK_INTERVAL_MS = 2000;  // once a play button exists, retry it this often until the video runs
+const PLAY_CLICK_MAX = 15;            // plenty of attempts, the button often appears late
+const AUTO_CONTINUE = true;       // dismiss Noorio's "long duration streaming" reminder automatically
+const CONTINUE_LABELS = ["Continue", "continue"];        // the keep-streaming button
+const SUPPRESS_LABEL = "No more pop-up prompts";         // the checkbox that stops the dialog coming back
+const DIALOG_CHECK_EVERY = 3;     // run the dialog scan every Nth tick, it walks the frame DOM
+const MUTE_ALL = true;            // mute every media element in every frame
+const CLICK_SOUND_BUTTON = true;  // also press Noorio's own speaker control so its icon shows muted
+const SOUND_CLICK_MAX = 2;        // cap, so a misread icon cannot toggle back and forth            // muted video may autoplay, unmuted may not
+const POLL_MS = 1200;             // main loop interval
+const SHOW_BANNER = true;         // Chory Lab header bar across the top, B toggles
+const BANNER_H = 46;              // header height in pixels
+const BANNER_TITLE = "Robot Cameras";   // text next to the wordmark
+const SHOW_HUD = true;            // per-tile labels, L toggles
+const DEBUG = true;               // console logging
+
+var WALL_GEN = 0;                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
+
+if (window.top === window.self && /wallGrid/.test(location.hash)) { startWall(); }
+
+function startWall() {
+  const fromHash = decodeURIComponent((location.hash.match(/cams=([^&]*)/) || [])[1] || "")
+    .split("||").map(function (s) { return s.trim(); }).filter(Boolean);
+  buildWall(fromHash.length ? fromHash : FALLBACK_CAMS);              // never block on discovery, show something now
+}
+
+// Reads the device list out of a frame that is already loaded. No hidden probe, no splash screen.
+//
+// The sidebar mixes camera names with status captions like "Device off" and "Device upgrading".
+// Names share one CSS class across every card, statuses share a different one, so the reliable
+// signal is: drop known status wording, group the remaining labels by class, take the biggest group.
+const STATUS_PATTERNS = [
+  /^device\b/i, /^offline$/i, /^off$/i, /^online$/i, /^upgrading$/i, /^updating$/i,
+  /^sleeping$/i, /^standby$/i, /^charging$/i, /^low battery$/i, /^no signal$/i, /^live$/i
+];
+
+function looksLikeStatus(t) {
+  return STATUS_PATTERNS.some(function (re) { return re.test(t); });
+}
+
+function readDeviceNames(doc) {
+  const leaves = Array.from(doc.querySelectorAll("div,span,p,li,a"))
+    .filter(function (e) { return e.children.length === 0 && e.textContent.trim(); });
+  const heading = leaves.filter(function (e) { return e.textContent.trim() === SIDEBAR_HEADING; })[0];
+  if (!heading) return [];
+
+  let container = heading.parentElement;                              // climb to the element holding the camera cards
+  for (let i = 0; i < 4 && container && container.parentElement; i++) {
+    if (container.querySelectorAll("img,canvas,video,svg").length >= 1) break;
+    container = container.parentElement;
+  }
+  if (!container) return [];
+
+  const groups = {};                                                  // className -> labels, in DOM order
+  Array.from(container.querySelectorAll("div,span,p,li,a")).forEach(function (e) {
+    if (e.children.length) return;
+    const t = e.textContent.trim();
+    if (!t || t === SIDEBAR_HEADING) return;
+    if (t.length > 40) return;                                        // names are short, body copy is not
+    if (/^[0-9\s:.\-]+$/.test(t)) return;                            // timestamps and counters
+    if (looksLikeStatus(t)) return;                                   // "Device off", "Device upgrading", ...
+    const cls = ((e.className && e.className.baseVal) || e.className || "").trim() || "(none)";
+    if (!groups[cls]) groups[cls] = [];
+    if (groups[cls].indexOf(t) === -1) groups[cls].push(t);
+  });
+
+  let best = [];
+  Object.keys(groups).forEach(function (cls) {
+    if (groups[cls].length > best.length) best = groups[cls];         // the class used by every camera card
+  });
+  return best;
+}
+
+// Columns are camera families: "Olivia" sits above "Olivia (Liquids)", one family per column.
+function layoutForCameras(cams) {
+  const groups = [];
+  const index = {};
+  cams.forEach(function (name) {
+    const base = name.split(" (")[0].trim();
+    if (!(base in index)) { index[base] = groups.length; groups.push({ base: base, items: [] }); }
+    groups[index[base]].items.push(name);
+  });
+  groups.forEach(function (g) {
+    g.items.sort(function (a, b) {                                    // the bare name first, variants after it
+      if (a === g.base) return -1;
+      if (b === g.base) return 1;
+      return a.localeCompare(b);
+    });
+  });
+  const rows = groups.reduce(function (m, g) { return Math.max(m, g.items.length); }, 1);
+  const placed = [];
+  groups.forEach(function (g, col) {
+    g.items.forEach(function (name, row) { placed.push({ name: name, col: col + 1, row: row + 1 }); });
+  });
+  return { cols: groups.length, rows: rows, placed: placed };
+}
+
+function log() { if (DEBUG) console.log("[noorio-wall]", ...arguments); }
+
+function buildWall(cams) {
+  if (!cams || !cams.length) { log("no cameras to show"); return; }
+  const gen = ++WALL_GEN;                                             // anything from an earlier build stops here
+  const oldGrid = document.getElementById("nw-grid");
+  if (oldGrid) oldGrid.remove();                                      // rebuilding after discovery
+  const layout = layoutForCameras(cams);
+  const cols = layout.cols, rows = layout.rows;
+  log("building wall for", cams, cols + " columns x " + rows + " rows");
+  document.title = "Noorio Wall";
+
+  const style = document.createElement("style");
+  style.textContent =
+    "html,body{margin:0!important;padding:0!important;width:100%!important;height:100%!important;" +
+    "overflow:hidden!important;background:#000!important;}" +
+    "#nw-bar{position:fixed;top:0;left:0;right:0;height:" + BANNER_H + "px;z-index:2147483647;" +
+    "display:flex;align-items:center;gap:16px;padding:0 18px;background:#16244d;color:#fff;" +
+    "box-shadow:0 1px 0 rgba(255,255,255,.06);font-family:'Jost','Century Gothic','Futura',sans-serif;}" +
+    "#nw-bar img{height:24px;width:auto;display:block;}" +
+    "#nw-bar .nw-fallback{font-size:17px;font-weight:500;letter-spacing:.06em;color:#fff;}" +
+    "#nw-bar .nw-rule{width:1px;height:20px;background:rgba(255,255,255,.22);}" +
+    "#nw-bar .nw-title{font-size:15px;font-weight:400;letter-spacing:.02em;color:#ccd8ec;}" +
+    "#nw-bar .nw-spacer{flex:1;}" +
+    "#nw-bar .nw-live{display:flex;align-items:center;gap:7px;font-size:12.5px;letter-spacing:.08em;" +
+    "text-transform:uppercase;color:#7fb2e5;}" +
+    "#nw-bar .nw-dot{width:7px;height:7px;border-radius:50%;background:#7fb2e5;}" +
+    "#nw-bar .nw-clock{font-size:13.5px;color:#ccd8ec;font-variant-numeric:tabular-nums;}" +
+    "#nw-bar .nw-help{font:inherit;font-size:13px;letter-spacing:.02em;color:#dbe6f6;cursor:pointer;" +
+    "background:none;border:1px solid rgba(255,255,255,.34);border-radius:2px;padding:5px 12px;" +
+    "transition:background .25s,border-color .25s,color .25s;}" +
+    "#nw-bar .nw-help:hover,#nw-bar .nw-help.open{background:rgba(127,178,229,.16);" +
+    "border-color:#7fb2e5;color:#fff;}" +
+    "#nw-keys{position:fixed;right:18px;z-index:2147483647;min-width:230px;padding:12px 14px;" +
+    "background:#0d1730;border-top:2px solid #1272b8;color:#ccd8ec;" +
+    "font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:14px;" +
+    "box-shadow:0 14px 40px rgba(8,15,35,.45);}" +
+    "#nw-keys .nw-row{display:flex;align-items:center;gap:12px;padding:5px 0;}" +
+    "#nw-keys kbd{display:inline-block;min-width:22px;text-align:center;background:rgba(255,255,255,.1);" +
+    "border:1px solid rgba(255,255,255,.2);border-radius:3px;padding:2px 6px;color:#fff;" +
+    "font-family:ui-monospace,Menlo,monospace;font-size:12px;}" +
+    "#nw-grid{position:fixed;inset:0;display:grid;gap:2px;background:#222;z-index:2147483646;}" +
+    "#nw-grid .nw-tile{position:relative;overflow:hidden;background:#000;}" +
+    "#nw-grid .nw-tile iframe{position:absolute;border:0;transform-origin:0 0;}" +
+    "#nw-grid .nw-hud{position:absolute;left:14px;top:14px;z-index:5;display:flex;align-items:center;" +
+    "gap:12px;padding:6px 22px 6px 6px;border-radius:999px;background:rgba(13,23,48,.74);" +
+    "border:1px solid rgba(255,255,255,.16);box-shadow:0 6px 18px rgba(8,15,35,.4);" +
+    "-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px);color:#fff;" +
+    "font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:19px;font-weight:500;" +
+    "letter-spacing:.015em;line-height:1;}" +
+    "#nw-grid .nw-hud.nw-noavatar{padding:10px 22px;}" +
+    "#nw-grid .nw-hud img{width:40px;height:40px;border-radius:50%;object-fit:cover;display:block;" +
+    "border:1px solid rgba(255,255,255,.28);}" +
+    "#nw-grid.nw-nohud .nw-hud{display:none;}";
+  document.documentElement.appendChild(style);
+
+  let bar = document.getElementById("nw-bar");
+  if (SHOW_BANNER && !bar) {
+    bar = document.createElement("div");
+    bar.id = "nw-bar";
+    const logo = document.createElement("img");
+    logo.src = (typeof NW_LOGO === "string") ? NW_LOGO : "";
+    logo.alt = "Chory Lab";
+    logo.onerror = function () {                                      // if the image will not render, fall back to type
+      const t = document.createElement("span");
+      t.className = "nw-fallback";
+      t.textContent = "CHORY LAB";
+      bar.replaceChild(t, logo);
+    };
+    const rule = document.createElement("div"); rule.className = "nw-rule";
+    const title = document.createElement("div"); title.className = "nw-title"; title.textContent = BANNER_TITLE;
+    const spacer = document.createElement("div"); spacer.className = "nw-spacer";
+    const live = document.createElement("div"); live.className = "nw-live";
+    const dot = document.createElement("span"); dot.className = "nw-dot";
+    const liveText = document.createElement("span"); liveText.textContent = "Live";
+    live.appendChild(dot); live.appendChild(liveText);
+    const help = document.createElement("button");
+    help.className = "nw-help";
+    help.type = "button";
+    help.textContent = "Shortcuts";
+    help.title = "Keyboard shortcuts";
+    help.addEventListener("click", function (e) { e.stopPropagation(); toggleKeys(); });
+
+    const clock = document.createElement("div"); clock.className = "nw-clock";
+    function tickClock() {
+      clock.textContent = new Date().toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+    }
+    tickClock();
+    setInterval(tickClock, 20000);
+    [logo, rule, title, spacer, live, help, clock].forEach(function (el) { bar.appendChild(el); });
+    document.documentElement.appendChild(bar);
+  }
+
+  const grid = document.createElement("div");
+  grid.id = "nw-grid";
+  if (SHOW_BANNER) grid.style.top = BANNER_H + "px";                  // sit under the header
+  grid.style.gridTemplateColumns = "repeat(" + cols + ", 1fr)";
+  grid.style.gridTemplateRows = "repeat(" + rows + ", 1fr)";
+  if (!SHOW_HUD) grid.classList.add("nw-nohud");
+  document.documentElement.appendChild(grid);
+
+  const panes = layout.placed.map(function (slot) {
+    const name = slot.name;
+    const tile = document.createElement("div");
+    tile.className = "nw-tile";
+    tile.style.gridColumn = String(slot.col);                         // family column, so pairs stay stacked
+    tile.style.gridRow = String(slot.row);
+    const frame = document.createElement("iframe");
+    frame.src = "/";                                                  // all frames load at once, this worked best
+    frame.width = FRAME_W;
+    frame.height = FRAME_H;
+    frame.allow = "autoplay; fullscreen";
+    const hud = document.createElement("div");
+    hud.className = "nw-hud";
+    const avatarSrc = (typeof NW_AVATARS === "object" && NW_AVATARS) ? NW_AVATARS[name.split(" ")[0]] : null;
+    if (avatarSrc) {
+      const av = document.createElement("img");
+      av.src = avatarSrc;
+      av.alt = "";
+      av.onerror = function () { av.remove(); hud.classList.add("nw-noavatar"); };
+      hud.appendChild(av);
+    } else {
+      hud.classList.add("nw-noavatar");                               // no picture for this camera, keep the padding even
+    }
+    const hudText = document.createElement("span");
+    hudText.textContent = name + ": loading";
+    hud.appendChild(hudText);
+    tile.appendChild(frame);
+    tile.appendChild(hud);
+    grid.appendChild(tile);
+    return { name: name, tile: tile, frame: frame, hud: hud, hudText: hudText,
+             state: "loading",                                        // loading -> selecting -> starting -> live, retried on timeout
+             turnStarted: Date.now(), cropped: false,
+             lastTime: -1, lastAdvance: 0, everPlayed: false,
+             playClicks: 0, lastPlayClick: 0, lastReload: 0, soundClicks: 0, lastErr: "" };
+  });
+
+
+  function media(doc) {
+    const nodes = Array.from(doc.querySelectorAll("video, canvas")).filter(function (n) {
+      const r = n.getBoundingClientRect();
+      return r.width > 120 && r.height > 90;
+    });
+    if (!nodes.length) return null;
+    return nodes.sort(function (a, b) {
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      return (rb.width * rb.height) - (ra.width * ra.height);
+    })[0];
+  }
+
+  function cardByName(doc, name) {
+    const leaves = Array.from(doc.querySelectorAll("div,span,p,li,a"))
+      .filter(function (e) { return e.children.length === 0 && e.textContent.trim() === name; });
+    if (!leaves.length) return null;
+    let el = leaves[0];
+    for (let i = 0; i < 6 && el.parentElement; i++) {
+      el = el.parentElement;
+      if (el.querySelector("img,svg,canvas,video")) return el;
+    }
+    return leaves[0].parentElement;
+  }
+
+  function realClick(win, el) {
+    const r = el.getBoundingClientRect();
+    const o = { bubbles: true, cancelable: true, view: win,
+                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(function (t) {
+      el.dispatchEvent(t.startsWith("pointer") ? new win.PointerEvent(t, o) : new win.MouseEvent(t, o));
+    });
+  }
+
+  function invokeFrameworkHandler(el, stopAt) {                       // call the app's own onClick as a plain function
+    for (let node = el; node && node !== stopAt; node = node.parentElement) {
+      const keys = Object.keys(node);
+      const rk = keys.find(function (k) {
+        return k.indexOf("__reactProps$") === 0 || k.indexOf("__reactEventHandlers$") === 0;
+      });
+      if (rk && node[rk] && typeof node[rk].onClick === "function") {
+        try {
+          node[rk].onClick({ target: node, currentTarget: node, nativeEvent: {},
+                             stopPropagation: function () {}, preventDefault: function () {} });
+          return "react";
+        } catch (e) { log("react handler threw", e && e.message); }
+      }
+      const v3 = node.__vueParentComponent;                           // Vue 3
+      if (v3 && v3.props && typeof v3.props.onClick === "function") {
+        try { v3.props.onClick({}); return "vue3"; } catch (e) { log("vue3 handler threw", e && e.message); }
+      }
+      const v2 = node.__vue__;                                        // Vue 2
+      if (v2 && typeof v2.$emit === "function") {
+        try { v2.$emit("click"); return "vue2"; } catch (e) { log("vue2 handler threw", e && e.message); }
+      }
+    }
+    return null;
+  }
+
+  function findPlayButton(doc, vid) {                                 // the round play control the app draws over a paused feed
+    const r = vid.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const cands = Array.from(doc.querySelectorAll('[class*="play"],[class*="Play"],[class*="start"],button,svg,i,span'))
+      .filter(function (e) {
+        const b = e.getBoundingClientRect();
+        if (b.width < 18 || b.width > 180 || b.height < 18 || b.height > 180) return false;
+        return Math.abs(b.left + b.width / 2 - cx) < 140 && Math.abs(b.top + b.height / 2 - cy) < 140;
+      });
+    if (cands.length) return cands[0];
+    const at = doc.elementFromPoint(cx, cy);                          // whatever sits over the middle of the video
+    return (at && at.tagName !== "VIDEO") ? at : null;
+  }
+
+  function clickPlayOverlay(p, doc, vid, target) {
+    if (!target) { return; }
+    const how = invokeFrameworkHandler(target, doc.body);             // preferred: call the handler, do not fake an event
+    if (how) {
+      log("invoked", how, "handler for", p.name);
+      p.lastErr = (p.lastErr || "") + " [handler:" + how + "]";
+    } else {
+      log("no framework handler found, dispatching events for", p.name, target.tagName, target.className);
+      p.lastErr = (p.lastErr || "") + " [no handler, dispatched]";
+      realClick(p.frame.contentWindow, target);
+    }
+  }
+
+  function muteEverything(doc) {                                      // covers extra audio or video elements the player creates
+    Array.from(doc.querySelectorAll("video, audio")).forEach(function (m) {
+      if (!m.muted) m.muted = true;
+      if (m.volume !== 0) m.volume = 0;
+    });
+  }
+
+  function muteViaPlayerButton(p, doc) {                              // make the app's own icon agree, not just the element
+    if (!CLICK_SOUND_BUTTON || p.soundClicks >= SOUND_CLICK_MAX) return;
+    const cands = Array.from(doc.querySelectorAll(
+      '[class*="volume"],[class*="sound"],[class*="mute"],[class*="audio"],' +
+      '[aria-label*="ute"],[aria-label*="ound"],[title*="ute"],[title*="ound"]'));
+    for (const el of cands) {
+      const tag = ((el.className && el.className.baseVal) || el.className || "") + " " +
+                  (el.getAttribute("aria-label") || "") + " " + (el.getAttribute("title") || "");
+      if (/muted|mute-on|off|close|silent|slash/i.test(tag)) continue;  // already showing muted, leave it
+      const r = el.getBoundingClientRect();
+      if (r.width < 12 || r.width > 80 || r.height < 12 || r.height > 80) continue;
+      log("pressing the player mute control for", p.name, tag.trim());
+      if (!invokeFrameworkHandler(el, doc.body)) realClick(p.frame.contentWindow, el);
+      p.soundClicks++;
+      return;
+    }
+  }
+
+  function dismissReminder(p, doc) {                                  // tick "no more prompts", then press Continue
+    if (!AUTO_CONTINUE) return false;
+    const leaves = Array.from(doc.querySelectorAll("button,div,span,a,p,label"))
+      .filter(function (e) { return e.children.length === 0; });
+
+    const suppress = leaves.filter(function (e) { return e.textContent.trim() === SUPPRESS_LABEL; })[0];
+    if (suppress) {                                                   // the checkbox sits next to its label
+      let box = null;
+      let scope = suppress.parentElement;
+      for (let i = 0; i < 3 && scope && !box; i++) {
+        box = scope.querySelector('input[type="checkbox"]') ||
+              scope.querySelector('[class*="checkbox"],[class*="check-box"]');
+        scope = scope.parentElement;
+      }
+      if (box) {
+        const already = (box.checked === true) || /checked|active|selected/i.test(box.className || "");
+        if (!already) {
+          log("ticking 'no more pop-up prompts' for", p.name);
+          invokeFrameworkHandler(box, doc.body) || realClick(p.frame.contentWindow, box);
+        }
+      }
+    }
+
+    const cont = leaves.filter(function (e) {
+      return CONTINUE_LABELS.indexOf(e.textContent.trim()) !== -1;
+    })[0];
+    if (!cont) return false;
+    log("dismissing the streaming reminder for", p.name);
+    if (!invokeFrameworkHandler(cont, doc.body)) realClick(p.frame.contentWindow, cont);
+    return true;
+  }
+
+  function crop(p) {
+    const doc = p.frame.contentDocument;
+    const vid = media(doc);
+    if (!vid) return false;
+    const r = vid.getBoundingClientRect();
+    if (r.width < 120 || r.height < 90) return false;
+    const tw = p.tile.clientWidth, th = p.tile.clientHeight;
+    const s = FIT === "cover" ? Math.max(tw / r.width, th / r.height) : Math.min(tw / r.width, th / r.height);
+    p.frame.style.transform = "scale(" + s + ")";
+    p.frame.style.left = (-r.left * s + (FIT === "cover" ? (tw - r.width * s) / 2 : 0)) + "px";
+    p.frame.style.top = (-r.top * s + (FIT === "cover" ? (th - r.height * s) / 2 : 0)) + "px";
+    doc.documentElement.style.overflow = "hidden";
+    return true;
+  }
+
+  function doc_of(p) {
+    try { return p.frame.contentDocument; } catch (e) { return null; }
+  }
+
+  function showHint(p, text) {
+    let h = p.tile.querySelector(".nw-hint");
+    if (!h) {
+      h = document.createElement("div");
+      h.className = "nw-hint";
+      h.style.cssText = "position:absolute;left:50%;top:62%;transform:translateX(-50%);z-index:6;" +
+                        "background:rgba(0,0,0,.72);color:#fff;font:13px Arial,Helvetica,sans-serif;" +
+                        "padding:5px 11px;border-radius:5px;pointer-events:none;";
+      p.tile.appendChild(h);
+    }
+    h.textContent = text;
+  }
+
+  function clearHint(p) {
+    const h = p.tile.querySelector(".nw-hint");
+    if (h) h.remove();
+  }
+
+  function drive(p) {                                                 // bring one pane up, independently of the others
+    const doc = doc_of(p);
+    if (!doc || !doc.body) { p.hudText.textContent = p.name + ": loading"; return; }
+
+    const elapsed = Date.now() - p.turnStarted;
+    const vid = media(doc);
+
+    if (!vid) {
+      const card = cardByName(doc, p.name);
+      if (card) {
+        p.state = "selecting";
+        p.hudText.textContent = p.name + ": selecting (" + Math.round(elapsed / 1000) + "s)";
+        realClick(p.frame.contentWindow, card.querySelector("img,svg,canvas") || card);
+      } else {
+        p.hudText.textContent = p.name + ": waiting for list (" + Math.round(elapsed / 1000) + "s)";
+      }
+      if (elapsed > START_TIMEOUT_MS) reloadPane(p, "retrying");      // some cameras only win the race on a later try
+      return;
+    }
+
+    crop(p);                                                          // show the frame as soon as there is one
+    if (vid.tagName === "VIDEO") {
+      if (MUTE_ALL) { vid.muted = true; vid.volume = 0; }
+      if (vid.paused) {
+        p.state = "starting";
+        vid.play().catch(function (e) { p.lastErr = (e && e.name) || "unknown"; });
+
+        const btn = findPlayButton(doc, vid);                         // the button often appears late, once other tiles settle
+        if (btn && Date.now() - (p.lastPlayClick || 0) > PLAY_CLICK_INTERVAL_MS && p.playClicks < PLAY_CLICK_MAX) {
+          p.playClicks++;
+          p.lastPlayClick = Date.now();
+          clickPlayOverlay(p, doc, vid, btn);                         // press it the moment it exists, then keep pressing
+          p.hudText.textContent = p.name + ": pressing play (" + p.playClicks + ")";
+        } else {
+          p.hudText.textContent = p.name + (btn ? ": play button up" : ": starting") +
+                              " (" + Math.round(elapsed / 1000) + "s)";
+        }
+        if (p.playClicks >= PLAY_CLICK_MAX) showHint(p, "click the play button");
+        if (elapsed > START_TIMEOUT_MS && p.playClicks >= PLAY_CLICK_MAX) reloadPane(p, "retrying");
+        return;
+      }
+    }
+
+    p.state = "live";
+    p.cropped = true;
+    p.everPlayed = true;
+    p.lastAdvance = Date.now();
+    p.hudText.textContent = p.name;
+    clearHint(p);
+  }
+
+  function reloadPane(p, why) {
+    if (Date.now() - p.lastReload < RELOAD_COOLDOWN_MS) return;
+    p.lastReload = Date.now();
+    log("reloading", p.name, "because", why);
+    p.hudText.textContent = p.name + ": " + why;
+    p.state = "loading"; p.cropped = false; p.playClicks = 0; p.soundClicks = 0;
+    p.lastTime = -1; p.everPlayed = false;
+    p.turnStarted = Date.now();
+    p.frame.style.transform = ""; p.frame.style.left = ""; p.frame.style.top = "";
+    p.frame.src = "/";
+  }
+
+  function maintain(p) {                                              // keep an already-live tile healthy
+    const doc = doc_of(p);
+    if (!doc || !doc.body) return;
+    const vid = media(doc);
+    if (!vid) { reloadPane(p, "lost video"); return; }
+    if (!p.cropped) p.cropped = crop(p);
+    if (vid.tagName !== "VIDEO") return;
+    if (MUTE_ALL) vid.muted = true;
+    if (vid.paused) { vid.play().catch(function () {}); return; }
+    if (Date.now() - p.lastAdvance < STALL_GRACE_MS) return;
+    if (STALL_SECONDS <= 0) return;
+    if (vid.networkState === 2) { p.lastAdvance = Date.now(); return; }
+    const t = vid.currentTime;
+    if (t !== p.lastTime) { p.lastTime = t; p.lastAdvance = Date.now(); return; }
+    if (Date.now() - p.lastAdvance > STALL_SECONDS * 1000) reloadPane(p, "stalled");
+  }
+
+  let discovered = !AUTO_DISCOVER;                                    // skip if discovery is switched off
+  function tryDiscover() {
+    if (discovered) return;
+    for (const p of panes) {
+      const doc = doc_of(p);
+      if (!doc || !doc.body) continue;
+      const names = readDeviceNames(doc);
+      if (!names.length || names.length > 12) continue;               // a huge list means the read went wrong
+      discovered = true;
+      const same = names.length === cams.length &&
+                   names.every(function (n) { return cams.indexOf(n) !== -1; });
+      log("discovered cameras:", names, same ? "(same as shown)" : "(rebuilding)");
+      if (!same) setTimeout(function () { buildWall(names); }, 50);   // rebuild with the real list
+      return;
+    }
+  }
+
+  let tickCount = 0;
+  function tick() {
+    if (gen !== WALL_GEN) return;                                     // a newer wall has taken over
+    tickCount++;
+    if (!discovered && tickCount % 4 === 0) tryDiscover();
+    const scanDialogs = AUTO_CONTINUE && (tickCount % DIALOG_CHECK_EVERY === 0);
+    panes.forEach(function (p) {
+      if (scanDialogs) {
+        const doc = doc_of(p);
+        if (doc && doc.body) {
+          try { dismissReminder(p, doc); } catch (e) { log("dialog scan failed", e && e.message); }
+          try { muteEverything(doc); muteViaPlayerButton(p, doc); } catch (e) { log("mute pass failed", e && e.message); }
+        }
+      }
+      if (p.state === "live") maintain(p); else drive(p);
+    });
+  }
+
+  const KEYS = [
+    ["F", "Fullscreen"],
+    ["B", "Hide or show this header"],
+    ["L", "Hide or show camera labels"],
+    ["R", "Restart all cameras"],
+    ["D", "Diagnostics"]
+  ];
+
+  function toggleKeys() {
+    const open = document.getElementById("nw-keys");
+    const btn = document.querySelector("#nw-bar .nw-help");
+    if (open) { open.remove(); if (btn) btn.classList.remove("open"); return; }
+    const box = document.createElement("div");
+    box.id = "nw-keys";
+    box.style.top = (SHOW_BANNER && bar && bar.style.display !== "none" ? BANNER_H + 8 : 8) + "px";
+    KEYS.forEach(function (k) {
+      const row = document.createElement("div");
+      row.className = "nw-row";
+      const key = document.createElement("kbd"); key.textContent = k[0];
+      const label = document.createElement("span"); label.textContent = k[1];
+      row.appendChild(key); row.appendChild(label);
+      box.appendChild(row);
+    });
+    box.addEventListener("click", function (e) { e.stopPropagation(); });
+    document.documentElement.appendChild(box);
+    if (btn) btn.classList.add("open");
+  }
+
+  document.addEventListener("click", function () {                    // click anywhere else to dismiss
+    const open = document.getElementById("nw-keys");
+    if (open) toggleKeys();
+  });
+
+  function diagnose() {
+    const lines = panes.map(function (p) {
+      const doc = doc_of(p);
+      if (!doc || !doc.body) return p.name + " [" + p.state + "]: no document";
+      const all = Array.from(doc.querySelectorAll("video, canvas")).map(function (n) {
+        const r = n.getBoundingClientRect();
+        return n.tagName.toLowerCase() + " " + Math.round(r.width) + "x" + Math.round(r.height);
+      });
+      const v = media(doc);
+      if (!v) return p.name + " [" + p.state + "]: no media | path " + doc.location.pathname +
+                     " | elements: " + (all.join(", ") || "none");
+      let info = p.name + " [" + p.state + "]: " + v.tagName.toLowerCase();
+      if (v.tagName === "VIDEO") {
+        info += " paused=" + v.paused + " muted=" + v.muted + " ready=" + v.readyState +
+                " net=" + v.networkState + " t=" + v.currentTime.toFixed(1) +
+                " " + v.videoWidth + "x" + v.videoHeight +
+                " src=" + (v.currentSrc ? v.currentSrc.slice(0, 36) : (v.srcObject ? "srcObject" : "none"));
+      }
+      if (p.lastErr) info += " | err=" + p.lastErr;
+      return info + " | all: " + all.join(", ");
+    });
+    let box = document.getElementById("nw-diag");
+    if (box) { box.remove(); return; }
+    box = document.createElement("div");
+    box.id = "nw-diag";
+    box.style.cssText = "position:fixed;left:12px;top:12px;right:12px;z-index:2147483647;background:rgba(0,0,0,.9);" +
+                        "color:#0f0;font:12px ui-monospace,Menlo,monospace;padding:12px 14px;border-radius:6px;" +
+                        "white-space:pre-wrap;line-height:1.6;";
+    box.textContent = "NOORIO WALL DIAGNOSTICS  (D closes)\n\n" + lines.join("\n\n");
+    document.documentElement.appendChild(box);
+    log("diagnostics:\n" + lines.join("\n"));
+  }
+
+  document.addEventListener("keydown", function (e) {
+    const k = e.key.toLowerCase();
+    if (e.key === "Escape" && document.getElementById("nw-keys")) { toggleKeys(); return; }
+    if (e.key === "?" || k === "h") { toggleKeys(); return; }
+    if (k === "d") diagnose();
+    if (k === "l") grid.classList.toggle("nw-nohud");
+    if (k === "b" && bar) {                                           // hide the header for a clean full-bleed wall
+      const hidden = bar.style.display === "none";
+      bar.style.display = hidden ? "" : "none";
+      grid.style.top = hidden ? BANNER_H + "px" : "0px";
+      setTimeout(function () { panes.forEach(function (p) { if (p.cropped) crop(p); }); }, 60);
+    }
+    if (k === "f") {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(function () {});
+      else document.exitFullscreen();
+    }
+    if (k === "r") {                                                  // full restart, sequential again
+      panes.forEach(function (p) { p.lastReload = 0; reloadPane(p, "manual restart"); });
+    }
+  });
+
+  window.addEventListener("resize", function () {
+    panes.forEach(function (p) { if (p.cropped) crop(p); });
+  });
+
+  if (RELOAD_MINUTES > 0) {
+    panes.forEach(function (p, i) {
+      setTimeout(function () {
+        setInterval(function () { reloadPane(p, "scheduled refresh"); }, RELOAD_MINUTES * 60000);
+      }, i * 30000);
+    });
+  }
+
+  chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+    if (msg && msg.action === "restart") {                            // toolbar button on an open wall
+      log("restart requested from the toolbar button");
+      panes.forEach(function (p) { p.lastReload = 0; reloadPane(p, "restart"); });
+      sendResponse({ ok: true });
+    }
+    return true;
+  });
+
+  setInterval(tick, POLL_MS);
+  tick();
+
+  log("wall built. D diagnostics, L labels, B banner, F fullscreen, R restart");
+}
