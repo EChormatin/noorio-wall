@@ -58,6 +58,15 @@ Keys inside the wall window:
 - `D` diagnostics, useful if something will not start
 - `?` or the Shortcuts button in the header shows this list
 
+## If it says "Signed out of Noorio"
+
+The wall uses your own Noorio session, and sessions expire. When that happens every tile would
+otherwise sit on a login form, so the wall shows a sign-in panel instead. Click "Sign in to Noorio",
+log in with the lab account, tick Remember me, then open the wall again from the toolbar button.
+
+If you signed in somewhere else in the meantime, "Try again" reloads the cameras without leaving
+the page.
+
 ## If a tile does not start
 
 Tiles that are slow show their status: "starting", "play button up", "pressing play (3)".

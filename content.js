@@ -362,6 +362,49 @@ function buildWall(cams) {
     }
   }
 
+  function looksSignedOut(doc) {                                      // a password field means Noorio is showing its login page
+    return !!doc.querySelector('input[type="password"]');
+  }
+
+  function showSignedOut() {
+    if (document.getElementById("nw-signedout")) return;
+    log("Noorio is signed out, showing the sign-in panel");
+    const top = (SHOW_BANNER && bar && bar.style.display !== "none") ? BANNER_H : 0;
+    const box = document.createElement("div");
+    box.id = "nw-signedout";
+    box.style.cssText = "position:fixed;left:0;right:0;bottom:0;top:" + top + "px;z-index:2147483647;" +
+                        "background:#0d1730;color:#ccd8ec;display:flex;flex-direction:column;" +
+                        "align-items:center;justify-content:center;gap:18px;text-align:center;padding:24px;" +
+                        "font-family:'Jost','Century Gothic','Futura',sans-serif;";
+    const h = document.createElement("div");
+    h.textContent = "Signed out of Noorio";
+    h.style.cssText = "font-size:26px;font-weight:500;color:#fff;letter-spacing:.01em;";
+    const sub = document.createElement("div");
+    sub.textContent = "The cameras need a Noorio session. Sign in, tick Remember me, then open the wall again.";
+    sub.style.cssText = "font-size:15px;max-width:460px;line-height:1.5;";
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:12px;margin-top:6px;";
+
+    const signin = document.createElement("button");
+    signin.textContent = "Sign in to Noorio";
+    signin.style.cssText = "font:inherit;font-size:15px;cursor:pointer;background:#1272b8;color:#fff;" +
+                           "border:1px solid #1272b8;border-radius:2px;padding:10px 22px;letter-spacing:.02em;";
+    signin.onclick = function () { location.href = "/"; };            // leave the grid, show the real full size login page
+
+    const retry = document.createElement("button");
+    retry.textContent = "Try again";
+    retry.style.cssText = "font:inherit;font-size:15px;cursor:pointer;background:none;color:#dbe6f6;" +
+                          "border:1px solid rgba(255,255,255,.34);border-radius:2px;padding:10px 22px;letter-spacing:.02em;";
+    retry.onclick = function () {                                     // already signed in elsewhere? reload the frames
+      box.remove();
+      panes.forEach(function (p) { p.lastReload = 0; reloadPane(p, "retry after sign in"); });
+    };
+
+    row.appendChild(signin); row.appendChild(retry);
+    [h, sub, row].forEach(function (el) { box.appendChild(el); });
+    document.documentElement.appendChild(box);
+  }
+
   function dismissReminder(p, doc) {                                  // tick "no more prompts", then press Continue
     if (!AUTO_CONTINUE) return false;
     const leaves = Array.from(doc.querySelectorAll("button,div,span,a,p,label"))
@@ -435,6 +478,13 @@ function buildWall(cams) {
     const doc = doc_of(p);
     if (!doc || !doc.body) { p.hudText.textContent = p.name + ": loading"; return; }
 
+    if (looksSignedOut(doc)) {                                        // no session, no point waiting for a camera list
+      p.state = "signedout";
+      p.hudText.textContent = p.name + ": signed out";
+      showSignedOut();
+      return;
+    }
+
     const elapsed = Date.now() - p.turnStarted;
     const vid = media(doc);
 
@@ -497,6 +547,7 @@ function buildWall(cams) {
   function maintain(p) {                                              // keep an already-live tile healthy
     const doc = doc_of(p);
     if (!doc || !doc.body) return;
+    if (looksSignedOut(doc)) { p.state = "signedout"; p.hudText.textContent = p.name + ": signed out"; showSignedOut(); return; }
     const vid = media(doc);
     if (!vid) { reloadPane(p, "lost video"); return; }
     if (!p.cropped) p.cropped = crop(p);
@@ -542,7 +593,16 @@ function buildWall(cams) {
           try { muteEverything(doc); muteViaPlayerButton(p, doc); } catch (e) { log("mute pass failed", e && e.message); }
         }
       }
-      if (p.state === "live") maintain(p); else drive(p);
+      if (p.state === "live") maintain(p);
+      else if (p.state === "signedout") {                             // recover by itself once a session exists again
+        const d = doc_of(p);
+        if (d && d.body && !looksSignedOut(d)) {
+          const box = document.getElementById("nw-signedout");
+          if (box) box.remove();
+          p.state = "loading"; p.turnStarted = Date.now();
+        }
+      }
+      else drive(p);
     });
   }
 
