@@ -2,7 +2,7 @@
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const layoutFor = new Function('cams',
-  src.slice(src.indexOf('function layoutForCameras(cams)'), src.indexOf('let WALL_GEN')) +
+  src.slice(src.indexOf('function layoutForCameras(cams)'), src.indexOf('function log()')) +
   '\nreturn layoutForCameras(cams);');
 
 const STATUS_RAIL_W = 270;

@@ -35,10 +35,11 @@ const PAUSE_RELOAD_AFTER_MS = 90000;  // still paused after this, reload the til
 const AUTO_CONTINUE = true;       // dismiss Noorio's "long duration streaming" reminder automatically
 const CONTINUE_LABELS = ["Continue", "continue"];        // the keep-streaming button
 const SUPPRESS_LABEL = "No more pop-up prompts";         // the checkbox that stops the dialog coming back
-const DISCOVER_EVERY_MS = 10000;  // how often to look for the camera list
+const DISCOVER_FAST_MS = 20000;   // look on every pass this long, so the list is known before any tile is playing
+const DISCOVER_EVERY_MS = 10000;  // how often to look for the camera list after that
 const DISCOVER_GIVEUP_MS = 120000;// and when to stop looking, rather than scanning every app forever
 const CAMS_STORE = "nw-cams";     // the camera list from the last run, so the first build is already the right one
-const REBUILD_WINDOW_MS = 30000;  // past this, a changed camera list waits for the next open instead of restarting the wall
+const REBUILD_WINDOW_MS = 45000;  // past this, a changed camera list waits for the next open instead of restarting the wall
 const DIALOG_CHECK_MS = 30000;    // the dialog and mute sweeps walk the whole app DOM, so keep them rare
 const SHOW_PROMO = true;          // the "learn more" bar in the bottom right corner
 const PROMO_TEXT = "Learn more about our research at chorylab.com";
@@ -69,7 +70,6 @@ var NW_LAST_RELOAD = 0;
 var WALL_BUILT_AT = 0;           // when the current wall was built, a late list change must not restart it
 var NW_PHASE = "loading";         // where boot got to, shown on the holding card and in any failure                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
 
-if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); }
 
 // Runs at document_start, before Noorio's app has painted anything. Paint our own background
 // immediately, then build the grid as soon as there is a DOM to build it in. Waiting for
@@ -83,6 +83,7 @@ function bootWall() {
       bootFail((e && e.message) || "script error");
     }
   });
+  log("remembered camera list:", cachedCams());
   const go = function () {
     bootSay("building");
     try { startWall(); }
@@ -756,12 +757,26 @@ function buildWall(cams) {
     const fw = Number(p.frame.width) || p.frame.offsetWidth || FRAME_W;
     const fh = Number(p.frame.height) || p.frame.offsetHeight || FRAME_H;
 
-    // Only the part of the video inside the frame's own viewport is actually painted. Scaling to
-    // the full rect when the video overflows left the frame's edge inside the tile, which showed
-    // as a black bar down the side.
-    const vx = Math.max(0, r.left), vy = Math.max(0, r.top);
-    const vw = Math.min(r.left + r.width, fw) - vx;
-    const vh = Math.min(r.top + r.height, fh) - vy;
+    // The player fits the picture inside its video element, so the element's rect can include the
+    // player's own black bars. Work out where the picture actually is before cropping to it,
+    // otherwise those bars end up along the edge of a tile.
+    let px = r.left, py = r.top, pw = r.width, ph = r.height;
+    if (vid.tagName === "VIDEO" && vid.videoWidth > 0 && vid.videoHeight > 0) {
+      const want = vid.videoWidth / vid.videoHeight, have = pw / ph;
+      if (want > have + 0.01) {                                       // bars above and below
+        const h = pw / want;
+        if (h > 80) { py += (ph - h) / 2; ph = h; }
+      } else if (want < have - 0.01) {                                // bars left and right
+        const w = ph * want;
+        if (w > 100) { px += (pw - w) / 2; pw = w; }
+      }
+    }
+
+    // Only the part inside the frame's own viewport is actually painted. Scaling to the full rect
+    // when the picture overflows left the frame's edge inside the tile, as a black bar down the side.
+    const vx = Math.max(0, px), vy = Math.max(0, py);
+    const vw = Math.min(px + pw, fw) - vx;
+    const vh = Math.min(py + ph, fh) - vy;
     if (vw < 100 || vh < 80) return false;
 
     let s = FIT === "cover" ? Math.max(tw / vw, th / vh) : Math.min(tw / vw, th / vh);
@@ -1124,8 +1139,7 @@ function buildWall(cams) {
       discovered = true;
       saveCams(names);                                                // the next open starts from this, so it will not rebuild
       if (sameCams(names, cams)) { log("discovered cameras:", names, "(same as shown)"); return; }
-      const anyLive = panes.some(function (q) { return q.everPlayed; });
-      if (anyLive || Date.now() - WALL_BUILT_AT > REBUILD_WINDOW_MS) {
+      if (Date.now() - WALL_BUILT_AT > REBUILD_WINDOW_MS) {
         log("discovered cameras:", names, "(saved for the next open)");
         return;                                                       // tearing down working video is worse than a stale list
       }
@@ -1140,7 +1154,10 @@ function buildWall(cams) {
     if (gen !== WALL_GEN) return;                                     // a newer wall has taken over
     tickCount++;
     const slowPass = (tickCount % Math.max(1, Math.round(LIVE_POLL_MS / POLL_MS))) !== 0;
-    if (!discovered && tickCount % Math.max(1, Math.round(DISCOVER_EVERY_MS / POLL_MS)) === 0) tryDiscover();
+    if (!discovered) {                                                // early and often, then rarely
+      const fast = Date.now() - WALL_BUILT_AT < DISCOVER_FAST_MS;
+      if (fast || tickCount % Math.max(1, Math.round(DISCOVER_EVERY_MS / POLL_MS)) === 0) tryDiscover();
+    }
     const scanDialogs = AUTO_CONTINUE &&
       (tickCount % Math.max(1, Math.round(DIALOG_CHECK_MS / POLL_MS)) === 0);
     panes.forEach(function (p) {
@@ -1274,3 +1291,7 @@ function buildWall(cams) {
 
   log("wall built. D diagnostics, L labels, B banner, F fullscreen, R restart");
 }
+
+// Entry point, deliberately last: everything above is defined by the time it runs, so nothing
+// boot touches can land in a temporal dead zone. The file still parses before the page paints.
+if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); }

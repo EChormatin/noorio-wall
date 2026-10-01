@@ -34,13 +34,15 @@ function boot(opts) {
     return { heading, labels, container };
   }
   const bar = sidebar(opts.sidebar || []);
+  const started = now;
+  const sidebarUp = () => !opts.sidebarAfter || (now - started) >= opts.sidebarAfter * 1000;
 
   const doc = {
     body: { tag: 'body' }, documentElement: { style: {} }, location: { pathname: '/' },
     querySelectorAll: (sel) => {
       if (/video/.test(sel) && /canvas/.test(sel)) return [video];
       if (/img|canvas|video|svg/.test(sel)) return [];
-      if (/div/.test(sel)) return [bar.heading].concat(bar.labels);
+      if (/div/.test(sel)) return sidebarUp() ? [bar.heading].concat(bar.labels) : [];
       if (/play/.test(sel)) return [];
       return [];
     },
@@ -120,11 +122,18 @@ check('a genuinely new camera rebuilds, once', added.grids.length === 2,
 check('and the new list is remembered for next time',
       JSON.parse(added.store['nw-cams'] || '[]').length === 3);
 
-// 3. the same discovery, but video is already up: do not tear it down
-const late = boot({ saved: ['Olivia', 'Benjamin'],
-                    sidebar: ['Olivia', 'Benjamin', 'Meredith'], playing: true });
-late.run(25);
-check('a list change never interrupts running video', late.grids.length === 1,
+// 3. the camera list is found while the covers are still up, even with video already playing
+const playing = boot({ saved: ['Olivia', 'Benjamin'],
+                       sidebar: ['Olivia', 'Benjamin', 'Meredith'], playing: true });
+playing.run(25);
+check('a missing camera is picked up on the first pass, not the next open', playing.grids.length === 2,
+      '(' + playing.grids.length + ' builds)');
+
+// 4. a sidebar that only appears much later must not restart a settled wall
+const late = boot({ saved: ['Olivia', 'Benjamin'], sidebar: ['Olivia', 'Benjamin', 'Meredith'],
+                    playing: true, sidebarAfter: 70 });
+late.run(150);
+check('a list change found later never interrupts running video', late.grids.length === 1,
       '(' + late.grids.length + ' build)');
 check('it still remembers the change for the next open',
       JSON.parse(late.store['nw-cams'] || '[]').length === 3);
