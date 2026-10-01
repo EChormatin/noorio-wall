@@ -94,6 +94,12 @@ not just ones that start later. Running runs come from the experiment tracker sh
 three robot calendars, both read without signing in. It refreshes every three minutes. Set
 SHOW_STATUS_PANEL to false in `content.js` to leave the cell empty instead.
 
+## Tests
+
+`./tests/run.command` runs the suites against `content.js`: the boot path, grid layout at one
+through six cameras, frame recycling, reload churn over a simulated eight hours, and how much work
+the wall does per minute once everything is playing. Run it after any change to the wall.
+
 ## Running it for days
 
 Four video streams left alone will slowly fill the tab's memory until Chrome kills it with
@@ -101,7 +107,12 @@ Four video streams left alone will slowly fill the tab's memory until Chrome kil
 reloading, which drops the old stream entirely. A tile that is playing is also checked far less
 often than one still starting, which is most of the CPU the wall uses.
 
-RECYCLE_MINUTES in `content.js` controls how often, and 0 turns it off.
+Reloads are also rationed: a tile may reload at most every five minutes, no two tiles reload within
+twenty seconds of each other, and the whole wall is capped at ten reloads an hour. A camera that
+will not start is retried twice and then left with a "click the play button" hint rather than being
+reloaded forever, which is what filled the tab in minutes.
+
+RECYCLE_MINUTES in `content.js` controls the refresh interval, and 0 turns it off.
 
 ## The status panel position
 

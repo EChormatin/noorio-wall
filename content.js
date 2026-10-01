@@ -10,6 +10,10 @@ const AUTO_DISCOVER = true;       // read the camera list from Noorio in the bac
 const SIDEBAR_HEADING = "All devices";   // the sidebar heading the discovery anchors on
 const FALLBACK_CAMS = ["Olivia", "Benjamin", "Olivia (Liquids)", "Benjamin (Liquids)"];  // used only if discovery fails
 const LOAD_STAGGER_MS = 400;      // small offset between frame loads, four app copies at once is a lot
+const FRAME_FIT = true;           // size each frame to its tile instead of always rendering 1500x950
+const FRAME_SCALE = 1.25;         // a little headroom above the tile size, for crop quality
+const FRAME_MIN_W = 900;          // the app needs some width or its layout changes
+const FRAME_MAX_W = 1500;
 const FRAME_W = 1500;             // internal width each frame renders at before cropping
 const FRAME_H = 950;              // internal height each frame renders at before cropping
 const FIT = "cover";              // "cover" fills the tile and crops, "contain" letterboxes
@@ -18,13 +22,19 @@ const STALL_SECONDS = 60;         // reload a live tile if its clock stops advan
 const STALL_GRACE_MS = 25000;     // ignore stall checks this long after a frame loads
 const RECYCLE_MINUTES = 30;       // replace each tile's frame this often, so a day-long stream cannot eat the tab
 const RECYCLE_SPREAD = true;      // offset the recycles so only one tile is ever reloading
-const RELOAD_COOLDOWN_MS = 45000; // never reload the same tile more often than this
+const RELOAD_COOLDOWN_MS = 300000;    // a single tile may not reload more often than this
+const RELOAD_GAP_MS = 20000;          // never two reloads anywhere on the wall inside this window
+const BLANK_PAUSE_MS = 400;           // let the old document go before loading the next one
+const MAX_RELOADS_PER_HOUR = 10;      // hard ceiling across the whole wall, churn is what kills the tab
+const MAX_START_ATTEMPTS = 2;         // after this many failed starts, stop reloading and ask for a click
 const PLAY_CLICK_INTERVAL_MS = 2000;  // once a play button exists, retry it this often until the video runs
 const PLAY_CLICK_MAX = 15;            // plenty of attempts, the button often appears late
 const AUTO_CONTINUE = true;       // dismiss Noorio's "long duration streaming" reminder automatically
 const CONTINUE_LABELS = ["Continue", "continue"];        // the keep-streaming button
 const SUPPRESS_LABEL = "No more pop-up prompts";         // the checkbox that stops the dialog coming back
-const DIALOG_CHECK_EVERY = 3;     // run the dialog scan every Nth tick, it walks the frame DOM
+const DISCOVER_EVERY_MS = 10000;  // how often to look for the camera list
+const DISCOVER_GIVEUP_MS = 120000;// and when to stop looking, rather than scanning every app forever
+const DIALOG_CHECK_MS = 30000;    // the dialog and mute sweeps walk the whole app DOM, so keep them rare
 const SHOW_PROMO = true;          // the "learn more" bar in the bottom right corner
 const PROMO_TEXT = "Learn more about our research at chorylab.com";
 const PROMO_URL = "https://www.chorylab.com";
@@ -48,7 +58,9 @@ const SHOW_HUD = true;            // per-tile labels, L toggles
 const DEBUG = true;               // console logging
 
 var WALL_GEN = 0;
-var NW_TIMERS = [];               // every interval the wall owns, so a rebuild can stop them                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
+var NW_TIMERS = [];               // every interval the wall owns, so a rebuild can stop them
+var NW_RELOAD_LOG = [];           // when frames were replaced, to keep churn inside a budget
+var NW_LAST_RELOAD = 0;                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
 
 if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); }
 
@@ -362,6 +374,8 @@ function buildWall(cams) {
     const stage = document.createElement("div");                      // the thing that rotates, the frame sits inside it
     stage.className = "nw-stage";
     const frame = makeFrame();
+    frame.width = frameSize().w;
+    frame.height = frameSize().h;
     if (LOAD_STAGGER_MS) {                                            // all at once still, just not the same millisecond
       setTimeout(function () { frame.src = "/"; }, layout.placed.indexOf(slot) * LOAD_STAGGER_MS);
     } else {
@@ -398,9 +412,19 @@ function buildWall(cams) {
              turnStarted: Date.now(), cropped: false,
              lastTime: -1, lastAdvance: 0, everPlayed: false,
              playClicks: 0, lastPlayClick: 0, lastReload: 0, soundClicks: 0, lastErr: "",
-             recycleAt: 0 };
+             recycleAt: 0, startAttempts: 0, vid: null };
   });
 
+
+  function mediaFor(p) {                                              // cache it, each lookup walks the whole app DOM
+    if (p.vid && p.vid.isConnected) {
+      const r = p.vid.getBoundingClientRect();
+      if (r.width > 120 && r.height > 90) return p.vid;
+    }
+    const doc = doc_of(p);
+    p.vid = doc && doc.body ? media(doc) : null;
+    return p.vid;
+  }
 
   function media(doc) {
     const nodes = Array.from(doc.querySelectorAll("video, canvas")).filter(function (n) {
@@ -496,6 +520,7 @@ function buildWall(cams) {
 
   function muteViaPlayerButton(p, doc) {                              // make the app's own icon agree, not just the element
     if (!CLICK_SOUND_BUTTON || p.soundClicks >= SOUND_CLICK_MAX) return;
+    p.soundClicks++;                                                  // count the attempt, found or not, so this ends
     const cands = Array.from(doc.querySelectorAll(
       '[class*="volume"],[class*="sound"],[class*="mute"],[class*="audio"],' +
       '[aria-label*="ute"],[aria-label*="ound"],[title*="ute"],[title*="ound"]'));
@@ -507,7 +532,6 @@ function buildWall(cams) {
       if (r.width < 12 || r.width > 80 || r.height < 12 || r.height > 80) continue;
       log("pressing the player mute control for", p.name, tag.trim());
       if (!invokeFrameworkHandler(el, doc.body)) realClick(p.frame.contentWindow, el);
-      p.soundClicks++;
       return;
     }
   }
@@ -587,10 +611,21 @@ function buildWall(cams) {
     return true;
   }
 
-  function makeFrame() {                                              // one fresh element per load, so old documents are dropped
+  function frameSize() {                                              // pixels we actually need, not a fixed 1500x950
+    if (!FRAME_FIT) return { w: FRAME_W, h: FRAME_H };
+    const vw = (window.innerWidth || 1600) - (railMode ? STATUS_RAIL_W : 0);
+    const vh = (window.innerHeight || 900) - (SHOW_BANNER ? BANNER_H : 0);
+    let w = Math.round((vw / Math.max(1, cols)) * FRAME_SCALE);
+    w = Math.max(FRAME_MIN_W, Math.min(FRAME_MAX_W, w));
+    const h = Math.round(w * (FRAME_H / FRAME_W));
+    return { w: w, h: h };
+  }
+
+  function makeFrame() {
     const f = document.createElement("iframe");
-    f.width = FRAME_W;
-    f.height = FRAME_H;
+    const size = frameSize();
+    f.width = size.w;
+    f.height = size.h;
     f.allow = "autoplay; fullscreen";
     f.style.background = "#0b0f1a";                                   // the iframe's own white is what used to flash
     return f;
@@ -647,7 +682,7 @@ function buildWall(cams) {
 
   function crop(p) {
     const doc = p.frame.contentDocument;
-    const vid = media(doc);
+    const vid = mediaFor(p);
     if (!vid) return false;
     const r = vid.getBoundingClientRect();
     if (r.width < 120 || r.height < 90) return false;
@@ -706,7 +741,10 @@ function buildWall(cams) {
       } else {
         p.hudText.textContent = p.name + ": waiting for list (" + Math.round(elapsed / 1000) + "s)";
       }
-      if (elapsed > START_TIMEOUT_MS) reloadPane(p, "retrying");      // some cameras only win the race on a later try
+      if (elapsed > START_TIMEOUT_MS) {
+        if (p.startAttempts < MAX_START_ATTEMPTS) { p.startAttempts++; reloadPane(p, "retrying"); }
+        else { p.state = "stuck"; p.hudText.textContent = p.name + ": not responding"; showHint(p, "click the play button"); }
+      }
       return;
     }
 
@@ -745,33 +783,51 @@ function buildWall(cams) {
     }
   }
 
+  function reloadAllowed(p, why) {
+    const now = Date.now();
+    if (now - p.lastReload < RELOAD_COOLDOWN_MS) { log("skip reload of", p.name, "- tile cooldown"); return false; }
+    if (now - NW_LAST_RELOAD < RELOAD_GAP_MS) { log("skip reload of", p.name, "- another tile just reloaded"); return false; }
+    NW_RELOAD_LOG = NW_RELOAD_LOG.filter(function (t) { return now - t < 3600000; });
+    if (NW_RELOAD_LOG.length >= MAX_RELOADS_PER_HOUR) {
+      log("reload budget spent, leaving", p.name, "alone");
+      return false;
+    }
+    return true;
+  }
+
   function reloadPane(p, why) {
-    if (Date.now() - p.lastReload < RELOAD_COOLDOWN_MS) return;
-    p.lastReload = Date.now();
+    if (!reloadAllowed(p, why)) return;
+    const now = Date.now();
+    p.lastReload = now;
+    NW_LAST_RELOAD = now;
+    NW_RELOAD_LOG.push(now);
     log("reloading", p.name, "because", why);
     p.hudText.textContent = p.name + ": " + why;
     p.state = "loading"; p.cropped = false; p.playClicks = 0; p.soundClicks = 0;
+    p.startAttempts = p.startAttempts || 0;
+    p.vid = null;
     p.lastTime = -1; p.everPlayed = false; p.lastErr = "";
     p.turnStarted = Date.now();
     p.recycleAt = 0;
 
-    const fresh = makeFrame();                                        // a new element, so the old document is dropped
-    try { p.stage.replaceChild(fresh, p.frame); }
-    catch (e) { p.stage.appendChild(fresh); }
-    p.frame = fresh;
-    fresh.src = "/";
+    // Reuse the element and blank it first. Creating a new iframe each time left the old
+    // document attached to its own timers and sockets, which is what filled the tab in minutes.
+    // about:blank forces the old document to be torn down before the next one loads.
+    p.frame.style.transform = ""; p.frame.style.left = ""; p.frame.style.top = "";
+    try { p.frame.src = "about:blank"; } catch (e) { log("blanking failed", e && e.message); }
+    const frame = p.frame;
+    setTimeout(function () { if (frame === p.frame) frame.src = "/"; }, BLANK_PAUSE_MS);
   }
 
   function maintain(p) {                                              // keep an already-live tile healthy
     if (p.recycleAt && Date.now() > p.recycleAt) {                    // scheduled recycle, one tile at a time
-      p.lastReload = 0;
-      reloadPane(p, "refreshing");
-      return;
+      if (reloadAllowed(p, "refreshing")) { reloadPane(p, "refreshing"); return; }
+      p.recycleAt = Date.now() + 5 * 60000;                           // budget busy, try again in five minutes
     }
     const doc = doc_of(p);
     if (!doc || !doc.body) return;
     if (looksSignedOut(doc)) { p.state = "signedout"; p.hudText.textContent = p.name + ": signed out"; showSignedOut(); return; }
-    const vid = media(doc);
+    const vid = mediaFor(p);
     if (!vid) { reloadPane(p, "lost video"); return; }
     if (!p.cropped) p.cropped = crop(p);
     if (vid.tagName !== "VIDEO") return;
@@ -927,8 +983,14 @@ function buildWall(cams) {
   }
 
   let discovered = !AUTO_DISCOVER;                                    // skip if discovery is switched off
+  const discoverStarted = Date.now();
   function tryDiscover() {
     if (discovered) return;
+    if (Date.now() - discoverStarted > DISCOVER_GIVEUP_MS) {          // never scan the apps forever
+      discovered = true;
+      log("camera discovery gave up, keeping the list we have");
+      return;
+    }
     for (const p of panes) {
       const doc = doc_of(p);
       if (!doc || !doc.body) continue;
@@ -948,8 +1010,9 @@ function buildWall(cams) {
     if (gen !== WALL_GEN) return;                                     // a newer wall has taken over
     tickCount++;
     const slowPass = (tickCount % Math.max(1, Math.round(LIVE_POLL_MS / POLL_MS))) !== 0;
-    if (!discovered && tickCount % 4 === 0) tryDiscover();
-    const scanDialogs = AUTO_CONTINUE && (tickCount % DIALOG_CHECK_EVERY === 0);
+    if (!discovered && tickCount % Math.max(1, Math.round(DISCOVER_EVERY_MS / POLL_MS)) === 0) tryDiscover();
+    const scanDialogs = AUTO_CONTINUE &&
+      (tickCount % Math.max(1, Math.round(DIALOG_CHECK_MS / POLL_MS)) === 0);
     panes.forEach(function (p) {
       if (scanDialogs) {
         const doc = doc_of(p);
@@ -959,6 +1022,13 @@ function buildWall(cams) {
         }
       }
       if (p.state === "live") { if (!slowPass) maintain(p); }         // playing tiles are checked every LIVE_POLL_MS
+      else if (p.state === "stuck") {                                 // left alone on purpose, but take it back if it starts
+        if (!slowPass) {
+          const d = doc_of(p);
+          const v = d && d.body ? media(d) : null;
+          if (v && v.tagName === "VIDEO" && !v.paused) { p.state = "live"; p.hudText.textContent = p.name; clearHint(p); }
+        }
+      }
       else if (p.state === "signedout") {                             // recover by itself once a session exists again
         const d = doc_of(p);
         if (d && d.body && !looksSignedOut(d)) {
