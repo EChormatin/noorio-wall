@@ -29,11 +29,16 @@ const MAX_RELOADS_PER_HOUR = 10;      // hard ceiling across the whole wall, chu
 const MAX_START_ATTEMPTS = 2;         // after this many failed starts, stop reloading and ask for a click
 const PLAY_CLICK_INTERVAL_MS = 2000;  // once a play button exists, retry it this often until the video runs
 const PLAY_CLICK_MAX = 15;            // plenty of attempts, the button often appears late
+const PAUSE_CLICK_AFTER_MS = 8000;    // a live tile that pauses: how long before pressing the app's play button
+const PAUSE_CLICK_EVERY_MS = 5000;    // and how often to retry that press
+const PAUSE_RELOAD_AFTER_MS = 90000;  // still paused after this, reload the tile (inside the reload budget)
 const AUTO_CONTINUE = true;       // dismiss Noorio's "long duration streaming" reminder automatically
 const CONTINUE_LABELS = ["Continue", "continue"];        // the keep-streaming button
 const SUPPRESS_LABEL = "No more pop-up prompts";         // the checkbox that stops the dialog coming back
 const DISCOVER_EVERY_MS = 10000;  // how often to look for the camera list
 const DISCOVER_GIVEUP_MS = 120000;// and when to stop looking, rather than scanning every app forever
+const CAMS_STORE = "nw-cams";     // the camera list from the last run, so the first build is already the right one
+const REBUILD_WINDOW_MS = 30000;  // past this, a changed camera list waits for the next open instead of restarting the wall
 const DIALOG_CHECK_MS = 30000;    // the dialog and mute sweeps walk the whole app DOM, so keep them rare
 const SHOW_PROMO = true;          // the "learn more" bar in the bottom right corner
 const PROMO_TEXT = "Learn more about our research at chorylab.com";
@@ -61,6 +66,7 @@ var WALL_GEN = 0;
 var NW_TIMERS = [];               // every interval the wall owns, so a rebuild can stop them
 var NW_RELOAD_LOG = [];           // when frames were replaced, to keep churn inside a budget
 var NW_LAST_RELOAD = 0;
+var WALL_BUILT_AT = 0;           // when the current wall was built, a late list change must not restart it
 var NW_PHASE = "loading";         // where boot got to, shown on the holding card and in any failure                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
 
 if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); }
@@ -150,7 +156,33 @@ function paintBackdrop() {
 function startWall() {
   const fromHash = decodeURIComponent((location.hash.match(/cams=([^&]*)/) || [])[1] || "")
     .split("||").map(function (s) { return s.trim(); }).filter(Boolean);
-  buildWall(fromHash.length ? fromHash : FALLBACK_CAMS);              // never block on discovery, show something now
+  buildWall(fromHash.length ? fromHash : (cachedCams() || FALLBACK_CAMS));   // never block on discovery, show something now
+}
+
+// Read synchronously, so the very first build already has the real list. Discovery finding a
+// different list and rebuilding the whole wall is what made the page and the videos load twice.
+function cachedCams() {
+  try {
+    const raw = localStorage.getItem(CAMS_STORE);
+    if (!raw) return null;
+    const names = JSON.parse(raw);
+    if (!Array.isArray(names) || !names.length || names.length > 12) return null;
+    const clean = names.filter(function (n) { return typeof n === "string" && n.trim(); });
+    return clean.length ? clean : null;
+  } catch (e) { return null; }
+}
+
+function saveCams(names) {
+  try { localStorage.setItem(CAMS_STORE, JSON.stringify(names)); }
+  catch (e) { log("could not remember the camera list", e && e.message); }
+}
+
+function sameCams(a, b) {                                             // order, spacing and case are not differences
+  const key = function (list) {
+    return list.map(function (s) { return String(s).replace(/\s+/g, " ").trim().toLowerCase(); })
+               .sort().join("||");
+  };
+  return key(a) === key(b);
 }
 
 // Reads the device list out of a frame that is already loaded. No hidden probe, no splash screen.
@@ -229,6 +261,7 @@ function log() { if (DEBUG) console.log("[noorio-wall]", ...arguments); }
 function buildWall(cams) {
   if (!cams || !cams.length) { log("no cameras to show"); return; }
   const gen = ++WALL_GEN;                                             // anything from an earlier build stops here
+  WALL_BUILT_AT = Date.now();
   const oldGrid = document.getElementById("nw-grid");
   if (oldGrid) oldGrid.remove();                                      // rebuilding after discovery
   const layout = layoutForCameras(cams);
@@ -270,6 +303,11 @@ function buildWall(cams) {
     "#nw-grid .nw-tile iframe{background:#0b0f1a;}" +
     "#nw-grid .nw-stage{position:absolute;left:50%;top:50%;overflow:hidden;}" +
     "#nw-grid .nw-tile iframe{position:absolute;border:0;transform-origin:0 0;}" +
+    "#nw-grid .nw-cover{position:absolute;inset:0;z-index:4;background:#0d1730;pointer-events:none;" +
+    "display:flex;align-items:center;justify-content:center;color:#5d7399;letter-spacing:.08em;" +
+    "text-transform:uppercase;font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:12.5px;" +
+    "transition:opacity .4s;}" +
+    "#nw-grid .nw-cover.nw-off{opacity:0;}" +
     "#nw-grid .nw-rot{position:absolute;right:10px;bottom:10px;z-index:6;cursor:pointer;" +
     "display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;" +
     "background:rgba(13,23,48,.68);border:1px solid rgba(255,255,255,.16);color:#dbe6f6;" +
@@ -422,17 +460,23 @@ function buildWall(cams) {
     rot.title = "Rotate this camera";
     rot.addEventListener("click", function (e) { e.stopPropagation(); rotatePane(name); });
 
+    const cover = document.createElement("div");                      // hides Noorio's sidebar and account page while the tile comes up
+    cover.className = "nw-cover";
+    cover.textContent = "Starting camera";
+
     tile.appendChild(stage);
+    tile.appendChild(cover);
     tile.appendChild(hud);
     tile.appendChild(rot);
     grid.appendChild(tile);
     return { name: name, tile: tile, stage: stage, frame: frame, hud: hud, hudText: hudText, rot: rot,
+             cover: cover,
              rotation: 0,                                             // replaced by applySavedRotations once storage answers
              state: "loading",                                        // loading -> selecting -> starting -> live, retried on timeout
              turnStarted: Date.now(), cropped: false,
              lastTime: -1, lastAdvance: 0, everPlayed: false,
              playClicks: 0, lastPlayClick: 0, lastReload: 0, soundClicks: 0, lastErr: "",
-             recycleAt: 0, startAttempts: 0, vid: null };
+             recycleAt: 0, startAttempts: 0, vid: null, pausedSince: 0 };
   });
 
 
@@ -754,6 +798,16 @@ function buildWall(cams) {
     h.textContent = text;
   }
 
+  function coverTile(p, text) {                                       // put the curtain back, e.g. while a tile reloads
+    if (!p.cover) return;
+    p.cover.textContent = text || "Starting camera";
+    p.cover.classList.remove("nw-off");
+  }
+
+  function revealTile(p) {                                            // only once cropped, playing video is behind it
+    if (p.cover) p.cover.classList.add("nw-off");
+  }
+
   function clearHint(p) {
     const h = p.tile.querySelector(".nw-hint");
     if (h) h.remove();
@@ -784,7 +838,10 @@ function buildWall(cams) {
       }
       if (elapsed > START_TIMEOUT_MS) {
         if (p.startAttempts < MAX_START_ATTEMPTS) { p.startAttempts++; reloadPane(p, "retrying"); }
-        else { p.state = "stuck"; p.hudText.textContent = p.name + ": not responding"; showHint(p, "click the play button"); }
+        else {
+          p.state = "stuck"; p.hudText.textContent = p.name + ": not responding";
+          showHint(p, "click the play button"); revealTile(p);        // it needs a human click, so let it be seen
+        }
       }
       return;
     }
@@ -806,7 +863,7 @@ function buildWall(cams) {
           p.hudText.textContent = p.name + (btn ? ": play button up" : ": starting") +
                               " (" + Math.round(elapsed / 1000) + "s)";
         }
-        if (p.playClicks >= PLAY_CLICK_MAX) showHint(p, "click the play button");
+        if (p.playClicks >= PLAY_CLICK_MAX) { showHint(p, "click the play button"); revealTile(p); }
         if (elapsed > START_TIMEOUT_MS && p.playClicks >= PLAY_CLICK_MAX) reloadPane(p, "retrying");
         return;
       }
@@ -814,6 +871,7 @@ function buildWall(cams) {
 
     p.state = "live";
     p.cropped = true;
+    revealTile(p);                                                    // real video is on screen, curtain comes down
     p.everPlayed = true;
     p.lastAdvance = Date.now();
     p.hudText.textContent = p.name;
@@ -844,9 +902,11 @@ function buildWall(cams) {
     NW_RELOAD_LOG.push(now);
     log("reloading", p.name, "because", why);
     p.hudText.textContent = p.name + ": " + why;
+    coverTile(p, why === "refreshing" ? "Refreshing" : "Reconnecting");
     p.state = "loading"; p.cropped = false; p.playClicks = 0; p.soundClicks = 0;
     p.startAttempts = p.startAttempts || 0;
     p.vid = null;
+    p.pausedSince = 0;
     p.lastTime = -1; p.everPlayed = false; p.lastErr = "";
     p.turnStarted = Date.now();
     p.recycleAt = 0;
@@ -870,10 +930,34 @@ function buildWall(cams) {
     if (looksSignedOut(doc)) { p.state = "signedout"; p.hudText.textContent = p.name + ": signed out"; showSignedOut(); return; }
     const vid = mediaFor(p);
     if (!vid) { reloadPane(p, "lost video"); return; }
-    if (!p.cropped) p.cropped = crop(p);
+    if (!p.cropped) { p.cropped = crop(p); if (p.cropped) revealTile(p); }
     if (vid.tagName !== "VIDEO") return;
     if (MUTE_ALL) vid.muted = true;
-    if (vid.paused) { vid.play().catch(function () {}); return; }
+
+    if (vid.paused) {                                                 // the stream ended and the app put its play button back
+      if (!p.pausedSince) { p.pausedSince = Date.now(); log(p.name, "went paused"); }
+      const stuckFor = Date.now() - p.pausedSince;
+      p.hudText.textContent = p.name + ": resuming (" + Math.round(stuckFor / 1000) + "s)";
+      vid.play().catch(function () {});                               // free if the stream is still there
+
+      if (stuckFor > PAUSE_CLICK_AFTER_MS &&
+          Date.now() - (p.lastPlayClick || 0) > PAUSE_CLICK_EVERY_MS) {
+        const btn = findPlayButton(doc, vid);                         // only looked for while actually paused
+        if (btn) {
+          p.lastPlayClick = Date.now();
+          log("pressing play again for", p.name);
+          clickPlayOverlay(p, doc, vid, btn);
+        }
+      }
+      if (stuckFor > PAUSE_RELOAD_AFTER_MS) reloadPane(p, "resuming");  // rationed by the reload budget
+      return;
+    }
+    if (p.pausedSince) {                                              // it came back
+      log(p.name, "resumed after", Math.round((Date.now() - p.pausedSince) / 1000) + "s");
+      p.pausedSince = 0;
+      p.hudText.textContent = p.name;
+      p.lastAdvance = Date.now();
+    }
     if (Date.now() - p.lastAdvance < STALL_GRACE_MS) return;
     if (STALL_SECONDS <= 0) return;
     if (vid.networkState === 2) { p.lastAdvance = Date.now(); return; }
@@ -1038,10 +1122,15 @@ function buildWall(cams) {
       const names = readDeviceNames(doc);
       if (!names.length || names.length > 12) continue;               // a huge list means the read went wrong
       discovered = true;
-      const same = names.length === cams.length &&
-                   names.every(function (n) { return cams.indexOf(n) !== -1; });
-      log("discovered cameras:", names, same ? "(same as shown)" : "(rebuilding)");
-      if (!same) setTimeout(function () { buildWall(names); }, 50);   // rebuild with the real list
+      saveCams(names);                                                // the next open starts from this, so it will not rebuild
+      if (sameCams(names, cams)) { log("discovered cameras:", names, "(same as shown)"); return; }
+      const anyLive = panes.some(function (q) { return q.everPlayed; });
+      if (anyLive || Date.now() - WALL_BUILT_AT > REBUILD_WINDOW_MS) {
+        log("discovered cameras:", names, "(saved for the next open)");
+        return;                                                       // tearing down working video is worse than a stale list
+      }
+      log("discovered cameras:", names, "(rebuilding)");
+      setTimeout(function () { buildWall(names); }, 50);
       return;
     }
   }
@@ -1062,12 +1151,14 @@ function buildWall(cams) {
           try { muteEverything(doc); muteViaPlayerButton(p, doc); } catch (e) { log("mute pass failed", e && e.message); }
         }
       }
-      if (p.state === "live") { if (!slowPass) maintain(p); }         // playing tiles are checked every LIVE_POLL_MS
+      if (p.state === "live") {                                       // playing tiles are cheap to watch, paused ones need attention
+        if (!slowPass || p.pausedSince) maintain(p);
+      }
       else if (p.state === "stuck") {                                 // left alone on purpose, but take it back if it starts
         if (!slowPass) {
           const d = doc_of(p);
           const v = d && d.body ? media(d) : null;
-          if (v && v.tagName === "VIDEO" && !v.paused) { p.state = "live"; p.hudText.textContent = p.name; clearHint(p); }
+          if (v && v.tagName === "VIDEO" && !v.paused) { p.state = "live"; p.hudText.textContent = p.name; clearHint(p); revealTile(p); }
         }
       }
       else if (p.state === "signedout") {                             // recover by itself once a session exists again
