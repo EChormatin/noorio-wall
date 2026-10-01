@@ -194,7 +194,13 @@ function buildWall(cams) {
     "#nw-info .nw-dot{width:8px;height:8px;border-radius:50%;background:#3fbf6f;flex:none;}" +
     "#nw-info .nw-m{font-size:13px;color:#9fb0cc;line-height:1.45;margin-top:2px;}" +
     "#nw-info .nw-none{font-size:13px;color:#8294b3;font-style:italic;}" +
-    "#nw-info .nw-foot{font-size:11.5px;color:#6b7d9c;letter-spacing:.02em;}";
+    "#nw-info .nw-foot{font-size:11.5px;color:#6b7d9c;letter-spacing:.02em;}" +
+    "#nw-info .nw-qr{margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12);" +
+    "display:flex;align-items:center;gap:12px;}" +
+    "#nw-info .nw-qr img{width:84px;height:84px;display:block;border-radius:3px;background:#fff;padding:4px;}" +
+    "#nw-info .nw-qr .nw-qrtext{min-width:0;}" +
+    "#nw-info .nw-qr .nw-qrlabel{font-size:14px;color:#fff;font-weight:500;line-height:1.3;}" +
+    "#nw-info .nw-qr .nw-qrurl{font-size:12px;color:#7fb2e5;margin-top:4px;word-break:break-all;}";
   document.documentElement.appendChild(style);
 
   let bar = document.getElementById("nw-bar");
@@ -731,6 +737,15 @@ function buildWall(cams) {
     }
     html += "</div><div class='nw-foot'>updated " +
             new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + "</div>";
+
+    if (typeof NW_QR === "string" && NW_QR) {                         // preprint pointer, scannable from across the bench
+      const label = (typeof NW_QR_LABEL === "string" && NW_QR_LABEL) || "Check out our preprint";
+      const url = (typeof NW_QR_URL === "string" && NW_QR_URL) || "";
+      const shown = url.replace(/^https?:\/\//, "");
+      html += "<div class='nw-qr'><img src='" + NW_QR + "' alt='" + esc(label) + "'>" +
+              "<div class='nw-qrtext'><div class='nw-qrlabel'>" + esc(label) + "</div>" +
+              "<div class='nw-qrurl'>" + esc(shown) + "</div></div></div>";
+    }
     infoBox.innerHTML = html;
   }
 

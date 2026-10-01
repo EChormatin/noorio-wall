@@ -94,6 +94,12 @@ not just ones that start later. Running runs come from the experiment tracker sh
 three robot calendars, both read without signing in. It refreshes every three minutes. Set
 SHOW_STATUS_PANEL to false in `content.js` to leave the cell empty instead.
 
+## The preprint QR code
+
+The status panel ends with a QR code for the TurboPRANCE preprint page, with the address printed
+under the caption. It is generated once and inlined in `qr.js`, so nothing is fetched to draw it.
+To point it somewhere else, regenerate that file with a new URL.
+
 ## Camera photos
 
 Each label shows a small photo next to the camera name. They live in `avatars.js`, keyed by the

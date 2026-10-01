@@ -11,6 +11,7 @@
       "js": [
         "logo.js",
         "avatars.js",
+        "qr.js",
         "content.js"
       ],
       "run_at": "document_idle",
