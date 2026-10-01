@@ -706,12 +706,33 @@ function buildWall(cams) {
     if (!vid) return false;
     const r = vid.getBoundingClientRect();
     if (r.width < 120 || r.height < 90) return false;
+
     const dims = layoutStage(p);                                      // rotation changes which side the video fills
     const tw = dims.w, th = dims.h;
-    const s = FIT === "cover" ? Math.max(tw / r.width, th / r.height) : Math.min(tw / r.width, th / r.height);
+    const fw = Number(p.frame.width) || p.frame.offsetWidth || FRAME_W;
+    const fh = Number(p.frame.height) || p.frame.offsetHeight || FRAME_H;
+
+    // Only the part of the video inside the frame's own viewport is actually painted. Scaling to
+    // the full rect when the video overflows left the frame's edge inside the tile, which showed
+    // as a black bar down the side.
+    const vx = Math.max(0, r.left), vy = Math.max(0, r.top);
+    const vw = Math.min(r.left + r.width, fw) - vx;
+    const vh = Math.min(r.top + r.height, fh) - vy;
+    if (vw < 100 || vh < 80) return false;
+
+    let s = FIT === "cover" ? Math.max(tw / vw, th / vh) : Math.min(tw / vw, th / vh);
+    if (FIT === "cover") s = Math.max(s, tw / fw, th / fh);           // the frame must cover the tile too
+
+    let left = -vx * s + (FIT === "cover" ? (tw - vw * s) / 2 : 0);
+    let top = -vy * s + (FIT === "cover" ? (th - vh * s) / 2 : 0);
+    if (FIT === "cover") {                                            // never let an edge of the frame come inside the tile
+      left = Math.min(0, Math.max(left, tw - fw * s));
+      top = Math.min(0, Math.max(top, th - fh * s));
+    }
+
     p.frame.style.transform = "scale(" + s + ")";
-    p.frame.style.left = (-r.left * s + (FIT === "cover" ? (tw - r.width * s) / 2 : 0)) + "px";
-    p.frame.style.top = (-r.top * s + (FIT === "cover" ? (th - r.height * s) / 2 : 0)) + "px";
+    p.frame.style.left = left + "px";
+    p.frame.style.top = top + "px";
     doc.documentElement.style.overflow = "hidden";
     return true;
   }
