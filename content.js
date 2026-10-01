@@ -60,7 +60,8 @@ const DEBUG = true;               // console logging
 var WALL_GEN = 0;
 var NW_TIMERS = [];               // every interval the wall owns, so a rebuild can stop them
 var NW_RELOAD_LOG = [];           // when frames were replaced, to keep churn inside a budget
-var NW_LAST_RELOAD = 0;                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
+var NW_LAST_RELOAD = 0;
+var NW_PHASE = "loading";         // where boot got to, shown on the holding card and in any failure                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
 
 if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); }
 
@@ -69,7 +70,15 @@ if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); 
 // document_idle meant staring at Noorio's white shell while its app booted.
 function bootWall() {
   paintBackdrop();
+  bootSay("starting");
+
+  window.addEventListener("error", function (e) {                     // anything thrown anywhere, while we are still booting
+    if (document.getElementById("nw-boot") && !document.getElementById("nw-grid")) {
+      bootFail((e && e.message) || "script error");
+    }
+  });
   const go = function () {
+    bootSay("building");
     try { startWall(); }
     catch (e) { bootFail((e && e.message) || String(e)); throw e; }   // never leave a blank navy page
   };
@@ -79,8 +88,10 @@ function bootWall() {
     go();
   }
   setTimeout(function () {                                            // nothing on screen after this means it failed quietly
-    if (!document.getElementById("nw-grid")) bootFail("the wall did not finish starting");
-  }, 25000);
+    if (!document.getElementById("nw-grid")) {
+      bootFail("the wall did not finish starting (last step: " + NW_PHASE + ")");
+    }
+  }, 10000);
 }
 
 function bootFail(message) {
@@ -91,6 +102,7 @@ function bootFail(message) {
     boot.id = "nw-boot";
     (document.body || document.documentElement).appendChild(boot);
   }
+  boot.dataset.failed = "1";
   boot.textContent = "";
   boot.style.flexDirection = "column";
   boot.style.gap = "14px";
@@ -111,6 +123,13 @@ function bootFail(message) {
                         "border:1px solid #1272b8;border-radius:2px;padding:9px 20px;letter-spacing:.02em;";
   again.onclick = function () { location.reload(); };
   [h, why, again].forEach(function (el) { boot.appendChild(el); });
+}
+
+function bootSay(phase) {                                             // the card says where it got to, not just a logo
+  NW_PHASE = phase;
+  const boot = document.getElementById("nw-boot");
+  if (boot && !boot.dataset.failed) boot.textContent = "Chory Lab robot cameras \u00b7 " + phase;
+  log("phase:", phase);
 }
 
 function paintBackdrop() {
@@ -362,6 +381,7 @@ function buildWall(cams) {
   grid.style.gridTemplateRows = "repeat(" + rows + ", 1fr)";
   if (!SHOW_HUD) grid.classList.add("nw-nohud");
   document.documentElement.appendChild(grid);
+  bootSay("grid built");
   const boot = document.getElementById("nw-boot");
   if (boot) boot.remove();                                            // grid is on screen, holding card no longer needed
 
