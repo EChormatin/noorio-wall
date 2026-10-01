@@ -172,6 +172,17 @@ function upcoming(cals) {
 }
 
 
+// A reservation that is under way on a robot already listed under Running now is the same
+// experiment seen twice, so only the live row is kept. Reservations on robots with no live
+// run stay, which is the case where a slot is booked but nothing has started.
+function dropRunning(reservations, runs) {
+  const busy = {};
+  (runs || []).forEach(function (r) { busy[(r.robot || "").trim().toLowerCase()] = true; });
+  return (reservations || []).filter(function (e) {
+    return !(e.active && busy[(e.robot || "").trim().toLowerCase()]);
+  });
+}
+
 async function labStatus() {
   const csv = await textOrNull(TRACKER_CSV);
   const cals = await Promise.all(ROBOT_CALENDARS.map(async function (c) {
@@ -181,7 +192,7 @@ async function labStatus() {
   }));
   let runs = [], reservations = [];
   try { runs = runningNow(csv); } catch (e) { log("tracker parse failed", e && e.message); }
-  try { reservations = upcoming(cals); } catch (e) { log("calendar parse failed", e && e.message); }
+  try { reservations = dropRunning(upcoming(cals), runs); } catch (e) { log("calendar parse failed", e && e.message); }
   return { runs: runs, reservations: reservations,                    // parsed here so the wall never does this work
            haveTracker: !!csv, at: Date.now() };
 }
