@@ -88,8 +88,9 @@ upright next time you open the wall.
 ## The status panel
 
 When the grid has a gap, which happens when one robot family has fewer cameras than another, the
-empty cell shows what is running now and what is reserved next, the same information as the rail on
-chorylab.com/equipment. Running runs come from the experiment tracker sheet, reservations from the
+empty cell shows what is running now and what is reserved, the same information as the rail on
+chorylab.com/equipment. Reservations include one already under way, which shows as "in progress",
+not just ones that start later. Running runs come from the experiment tracker sheet, reservations from the
 three robot calendars, both read without signing in. It refreshes every three minutes. Set
 SHOW_STATUS_PANEL to false in `content.js` to leave the cell empty instead.
 

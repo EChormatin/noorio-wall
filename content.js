@@ -24,7 +24,9 @@ const CONTINUE_LABELS = ["Continue", "continue"];        // the keep-streaming b
 const SUPPRESS_LABEL = "No more pop-up prompts";         // the checkbox that stops the dialog coming back
 const DIALOG_CHECK_EVERY = 3;     // run the dialog scan every Nth tick, it walks the frame DOM
 const SHOW_STATUS_PANEL = true;   // fill an empty grid cell with what is running and what is reserved
+const STATUS_FIRST_DELAY_MS = 20000;  // leave the cameras alone while they start, then fetch lab status
 const STATUS_REFRESH_MS = 180000; // re-ask the background for lab status every three minutes
+const ICS_MAX_CHARS = 400000;     // only the tail of a calendar feed matters, and some are huge
 const STATUS_MAX_ROWS = 3;        // keep the panel small, it has to fit one tile
 const ROTATE_STORE = "nw-rotation";   // localStorage key holding {cameraName: degrees}
 const MUTE_ALL = true;            // mute every media element in every frame
@@ -174,13 +176,18 @@ function upcoming(cals) {
   const out = [];
   (cals || []).forEach(function (c) {
     if (!c || !c.ics) return;
-    const body = c.ics.replace(/\r\n[ \t]/g, "");                     // unfold wrapped ICS lines
+    const raw = c.ics.length > ICS_MAX_CHARS ? c.ics.slice(-ICS_MAX_CHARS) : c.ics;
+    const body = raw.replace(/\r\n[ \t]/g, "");                        // unfold wrapped ICS lines
     body.split("BEGIN:VEVENT").slice(1).forEach(function (chunk) {
       if (/RRULE:/.test(chunk)) return;                                // repeating events are not reservations here
       const start = icsDate((chunk.match(/\nDTSTART[^:]*:([^\r\n]+)/) || [])[1]);
+      const end = icsDate((chunk.match(/\nDTEND[^:]*:([^\r\n]+)/) || [])[1]);
       const summary = ((chunk.match(/\nSUMMARY:([^\r\n]*)/) || [])[1] || "").trim();
-      if (!start || start.getTime() < now) return;
-      out.push({ robot: c.name, start: start, summary: summary });
+      if (!start) return;
+      const finish = end ? end.getTime() : start.getTime() + 3600000;  // no DTEND, assume an hour
+      if (finish <= now) return;                                       // over and done with
+      out.push({ robot: c.name, start: start, end: end, summary: summary,
+                 active: start.getTime() <= now });                    // reserved and already under way
     });
   });
   out.sort(function (a, b) { return a.start - b.start; });
@@ -370,7 +377,7 @@ function buildWall(cams) {
     tile.appendChild(rot);
     grid.appendChild(tile);
     return { name: name, tile: tile, stage: stage, frame: frame, hud: hud, hudText: hudText, rot: rot,
-             rotation: loadRotation(name),
+             rotation: 0,                                             // replaced by applySavedRotations once storage answers
              state: "loading",                                        // loading -> selecting -> starting -> live, retried on timeout
              turnStarted: Date.now(), cropped: false,
              lastTime: -1, lastAdvance: 0, everPlayed: false,
@@ -563,16 +570,29 @@ function buildWall(cams) {
     return true;
   }
 
-  function loadRotation(name) {
-    try { return (JSON.parse(localStorage.getItem(ROTATE_STORE) || "{}")[name] | 0) % 360; }
-    catch (e) { return 0; }
+  function applySavedRotations() {                                    // extension storage survives anything the app does
+    try {
+      chrome.storage.local.get([ROTATE_STORE], function (got) {
+        const all = (got && got[ROTATE_STORE]) || {};
+        let any = false;
+        panes.forEach(function (p) {
+          const deg = (all[p.name] | 0) % 360;
+          if (deg !== p.rotation) { p.rotation = deg; any = true; }
+          layoutStage(p);
+        });
+        if (any) { log("restored saved rotations", all); panes.forEach(function (p) { crop(p); }); }
+      });
+    } catch (e) { log("could not read rotations", e && e.message); }
   }
 
   function saveRotation(name, deg) {
     try {
-      const all = JSON.parse(localStorage.getItem(ROTATE_STORE) || "{}");
-      if (deg) all[name] = deg; else delete all[name];
-      localStorage.setItem(ROTATE_STORE, JSON.stringify(all));
+      chrome.storage.local.get([ROTATE_STORE], function (got) {
+        const all = (got && got[ROTATE_STORE]) || {};
+        if (deg) all[name] = deg; else delete all[name];
+        const payload = {}; payload[ROTATE_STORE] = all;
+        chrome.storage.local.set(payload, function () { log("saved rotation", name, deg); });
+      });
     } catch (e) { log("could not save rotation", e && e.message); }
   }
 
@@ -757,6 +777,15 @@ function buildWall(cams) {
 
   function renderStatus(data) {
     if (!infoBox) return;
+    try { renderStatusInner(data); }
+    catch (e) {
+      log("status panel failed", e && e.message);
+      infoBox.innerHTML = "<div class='nw-sect'><h3>Running now</h3>" +
+                          "<div class='nw-none'>Status unavailable</div></div>";
+    }
+  }
+
+  function renderStatusInner(data) {
     const runs = runningNow(data && data.csv);
     const next = upcoming(data && data.cals);
     const esc = function (t) { const d = document.createElement("div"); d.textContent = t; return d.innerHTML; };
@@ -778,9 +807,12 @@ function buildWall(cams) {
       html += "<div class='nw-none'>Nothing reserved</div>";
     } else {
       next.forEach(function (e) {
-        html += "<div class='nw-item' style='border-left-color:#4b5f85'>" +
+        const when = e.active
+          ? "in progress" + (e.end ? ", until " + fmtWhen(e.end) : "")
+          : fmtWhen(e.start);
+        html += "<div class='nw-item' style='border-left-color:" + (e.active ? "#7fb2e5" : "#4b5f85") + "'>" +
                 "<div class='nw-t'>" + esc(e.robot) + "</div>" +
-                "<div class='nw-m'>" + esc(fmtWhen(e.start)) + (e.summary ? " \u00b7 " + esc(e.summary) : "") +
+                "<div class='nw-m'>" + esc(when) + (e.summary ? " \u00b7 " + esc(e.summary) : "") +
                 "</div></div>";
       });
     }
@@ -799,7 +831,12 @@ function buildWall(cams) {
     } catch (e) { log("status request threw", e && e.message); }
   }
 
-  if (infoBox) { refreshStatus(); setInterval(refreshStatus, STATUS_REFRESH_MS); }
+  if (infoBox) {                                                      // cameras first, status after they settle
+    setTimeout(function () {
+      refreshStatus();
+      setInterval(refreshStatus, STATUS_REFRESH_MS);
+    }, STATUS_FIRST_DELAY_MS);
+  }
 
   let discovered = !AUTO_DISCOVER;                                    // skip if discovery is switched off
   function tryDiscover() {
@@ -936,7 +973,8 @@ function buildWall(cams) {
     panes.forEach(function (p) { layoutStage(p); if (p.cropped) crop(p); });
   });
 
-  panes.forEach(layoutStage);                                         // apply any saved rotation straight away
+  panes.forEach(layoutStage);
+  applySavedRotations();                                              // bring back each camera's saved angle
 
   if (RELOAD_MINUTES > 0) {
     panes.forEach(function (p, i) {
