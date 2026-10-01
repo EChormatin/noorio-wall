@@ -94,6 +94,12 @@ not just ones that start later. Running runs come from the experiment tracker sh
 three robot calendars, both read without signing in. It refreshes every three minutes. Set
 SHOW_STATUS_PANEL to false in `content.js` to leave the cell empty instead.
 
+## The chorylab.com bar
+
+A small bar sits in the bottom right corner reading "Learn more about our research at
+chorylab.com", and clicking it opens the site in a new tab. Set SHOW_PROMO to false in
+`content.js` to drop it, or change PROMO_TEXT and PROMO_URL there.
+
 ## The preprint QR code
 
 The status panel ends with a QR code for the TurboPRANCE preprint page, with the address printed

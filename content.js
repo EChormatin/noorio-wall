@@ -24,6 +24,9 @@ const AUTO_CONTINUE = true;       // dismiss Noorio's "long duration streaming" 
 const CONTINUE_LABELS = ["Continue", "continue"];        // the keep-streaming button
 const SUPPRESS_LABEL = "No more pop-up prompts";         // the checkbox that stops the dialog coming back
 const DIALOG_CHECK_EVERY = 3;     // run the dialog scan every Nth tick, it walks the frame DOM
+const SHOW_PROMO = true;          // the "learn more" bar in the bottom right corner
+const PROMO_TEXT = "Learn more about our research at chorylab.com";
+const PROMO_URL = "https://www.chorylab.com";
 const SHOW_STATUS_PANEL = true;   // fill an empty grid cell with what is running and what is reserved
 const STATUS_FIRST_DELAY_MS = 20000;  // leave the cameras alone while they start, then fetch lab status
 const STATUS_REFRESH_MS = 180000; // re-ask the background for lab status every three minutes
@@ -174,6 +177,15 @@ function buildWall(cams) {
     "opacity:0;transition:opacity .2s;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);}" +
     "#nw-grid .nw-tile:hover .nw-rot{opacity:1;}" +
     "#nw-grid .nw-rot.nw-on{opacity:1;color:#fff;border-color:#7fb2e5;}" +
+    "#nw-grid .nw-tile.nw-lastcell .nw-rot{bottom:58px;}" +            // keep clear of the promo bar
+    "#nw-promo{position:fixed;right:0;bottom:0;z-index:2147483647;display:flex;align-items:center;gap:9px;" +
+    "padding:11px 18px;background:#16244d;color:#dbe6f6;text-decoration:none;" +
+    "border-top:1px solid rgba(255,255,255,.14);border-left:1px solid rgba(255,255,255,.14);" +
+    "border-top-left-radius:4px;box-shadow:0 -4px 20px rgba(8,15,35,.35);" +
+    "font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:14px;letter-spacing:.015em;" +
+    "transition:background .25s,color .25s;}" +
+    "#nw-promo:hover{background:#1c3160;color:#fff;}" +
+    "#nw-promo .nw-mark{width:7px;height:7px;border-radius:50%;background:#7fb2e5;flex:none;}" +
     "#nw-grid .nw-hud{position:absolute;left:14px;top:14px;z-index:5;display:flex;align-items:center;" +
     "gap:12px;padding:6px 22px 6px 6px;border-radius:999px;background:rgba(13,23,48,.74);" +
     "border:1px solid rgba(255,255,255,.16);box-shadow:0 6px 18px rgba(8,15,35,.4);" +
@@ -679,6 +691,26 @@ function buildWall(cams) {
       log("status panel placed at column " + slot.col + ", row " + slot.row);
     }
   }
+
+  if (SHOW_PROMO && !document.getElementById("nw-promo")) {
+    const promo = document.createElement("a");
+    promo.id = "nw-promo";
+    promo.href = PROMO_URL;
+    promo.target = "_blank";
+    promo.rel = "noopener";
+    const mark = document.createElement("span");
+    mark.className = "nw-mark";
+    const txt = document.createElement("span");
+    txt.textContent = PROMO_TEXT;
+    promo.appendChild(mark);
+    promo.appendChild(txt);
+    document.documentElement.appendChild(promo);
+  }
+
+  panes.forEach(function (p, i) {                                     // bottom right tile shares that corner with the bar
+    const sl = layout.placed[i];
+    if (SHOW_PROMO && sl && sl.col === cols && sl.row === rows) p.tile.classList.add("nw-lastcell");
+  });
 
   function fmtWhen(d) {
     const now = new Date();
