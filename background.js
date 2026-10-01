@@ -70,6 +70,108 @@ async function textOrNull(url) {
   } catch (e) { log("fetch threw", e && e.message, url); return null; }
 }
 
+const STATUS_MAX_ROWS = 3;        // keep the panel small, it has to fit one tile
+const ICS_MAX_CHARS = 400000;     // only the tail of a calendar feed matters, and some are huge
+
+// Minimal CSV reader: quoted fields, doubled quotes, commas and newlines inside quotes.
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; }
+      else field += c;
+    } else if (c === '"') { quoted = true; }
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c !== "\r") { field += c; }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// "9-3-26 7:15 PM" is what the robots write, and new Date() will not take it.
+function labDate(v) {
+  const t = (v || "").trim();
+  if (!t) return null;
+  const m = t.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})(?:[ ,]+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp])?)?/);
+  if (m) {
+    let [, mo, da, yr, hh, mi, ap] = m;
+    yr = +yr; if (yr < 100) yr += 2000;
+    let hour = hh ? +hh : 0;
+    if (ap) { const pm = /p/i.test(ap); if (pm && hour < 12) hour += 12; if (!pm && hour === 12) hour = 0; }
+    return new Date(yr, +mo - 1, +da, hour, mi ? +mi : 0);
+  }
+  const d = new Date(t);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// Live runs out of the experiment tracker: a row that is not TERMINATED.
+function runningNow(csv) {
+  if (!csv) return [];
+  const rows = parseCSV(csv);
+  if (rows.length < 2) return [];
+  const head = rows[0].map(function (h) { return h.trim().toLowerCase(); });
+  const col = function (name) { return head.indexOf(name.toLowerCase()); };   // first match wins, headers repeat
+  const iStart = col("Start Date"), iRobot = col("RobotID"), iUser = col("User");
+  const iMethod = col("Method"), iFolder = col("Folder Name"), iTerm = col("TERMINATED");
+  if (iRobot < 0) return [];
+  const out = [];
+  for (let r = rows.length - 1; r > 0 && out.length < STATUS_MAX_ROWS * 3; r--) {
+    const row = rows[r];
+    if (!row || !row.length) continue;
+    const robot = (row[iRobot] || "").trim();
+    if (!robot) continue;
+    const term = iTerm >= 0 ? (row[iTerm] || "").trim() : "";
+    if (term && !/^(no|false|0)$/i.test(term)) continue;               // anything in TERMINATED means finished
+    const started = iStart >= 0 ? labDate(row[iStart]) : null;
+    out.push({
+      robot: robot,
+      user: iUser >= 0 ? (row[iUser] || "").trim() : "",
+      method: iMethod >= 0 ? (row[iMethod] || "").trim() : "",
+      folder: iFolder >= 0 ? (row[iFolder] || "").trim() : "",
+      started: started,
+      hours: started ? (Date.now() - started.getTime()) / 3600000 : null
+    });
+  }
+  return out.slice(0, STATUS_MAX_ROWS);
+}
+
+// Upcoming reservations out of a public Google Calendar ICS feed.
+function icsDate(v) {
+  const m = (v || "").match(/(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?/);
+  if (!m) return null;
+  const [, y, mo, d, hh, mi, ss, z] = m;
+  if (!hh) return new Date(+y, +mo - 1, +d);
+  return z ? new Date(Date.UTC(+y, +mo - 1, +d, +hh, +mi, +ss))
+           : new Date(+y, +mo - 1, +d, +hh, +mi, +ss);
+}
+
+function upcoming(cals) {
+  const now = Date.now();
+  const out = [];
+  (cals || []).forEach(function (c) {
+    if (!c || !c.ics) return;
+    const raw = c.ics.length > ICS_MAX_CHARS ? c.ics.slice(-ICS_MAX_CHARS) : c.ics;
+    const body = raw.replace(/\r\n[ \t]/g, "");                        // unfold wrapped ICS lines
+    body.split("BEGIN:VEVENT").slice(1).forEach(function (chunk) {
+      if (/RRULE:/.test(chunk)) return;                                // repeating events are not reservations here
+      const start = icsDate((chunk.match(/\nDTSTART[^:]*:([^\r\n]+)/) || [])[1]);
+      const end = icsDate((chunk.match(/\nDTEND[^:]*:([^\r\n]+)/) || [])[1]);
+      const summary = ((chunk.match(/\nSUMMARY:([^\r\n]*)/) || [])[1] || "").trim();
+      if (!start) return;
+      const finish = end ? end.getTime() : start.getTime() + 3600000;  // no DTEND, assume an hour
+      if (finish <= now) return;                                       // over and done with
+      out.push({ robot: c.name, start: start, end: end, summary: summary,
+                 active: start.getTime() <= now });                    // reserved and already under way
+    });
+  });
+  out.sort(function (a, b) { return a.start - b.start; });
+  return out.slice(0, STATUS_MAX_ROWS);
+}
+
+
 async function labStatus() {
   const csv = await textOrNull(TRACKER_CSV);
   const cals = await Promise.all(ROBOT_CALENDARS.map(async function (c) {
@@ -77,7 +179,11 @@ async function labStatus() {
                                  encodeURIComponent(c.id) + "/public/basic.ics");
     return { name: c.name, ics: ics };
   }));
-  return { csv: csv, cals: cals, at: Date.now() };
+  let runs = [], reservations = [];
+  try { runs = runningNow(csv); } catch (e) { log("tracker parse failed", e && e.message); }
+  try { reservations = upcoming(cals); } catch (e) { log("calendar parse failed", e && e.message); }
+  return { runs: runs, reservations: reservations,                    // parsed here so the wall never does this work
+           haveTracker: !!csv, at: Date.now() };
 }
 
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {

@@ -9,6 +9,7 @@
 const AUTO_DISCOVER = true;       // read the camera list from Noorio in the background and rebuild if it differs
 const SIDEBAR_HEADING = "All devices";   // the sidebar heading the discovery anchors on
 const FALLBACK_CAMS = ["Olivia", "Benjamin", "Olivia (Liquids)", "Benjamin (Liquids)"];  // used only if discovery fails
+const LOAD_STAGGER_MS = 400;      // small offset between frame loads, four app copies at once is a lot
 const FRAME_W = 1500;             // internal width each frame renders at before cropping
 const FRAME_H = 950;              // internal height each frame renders at before cropping
 const FIT = "cover";              // "cover" fills the tile and crops, "contain" letterboxes
@@ -96,104 +97,6 @@ function readDeviceNames(doc) {
   return best;
 }
 
-// Minimal CSV reader: quoted fields, doubled quotes, commas and newlines inside quotes.
-function parseCSV(text) {
-  const rows = [];
-  let row = [], field = "", quoted = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (quoted) {
-      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; }
-      else field += c;
-    } else if (c === '"') { quoted = true; }
-    else if (c === ",") { row.push(field); field = ""; }
-    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
-    else if (c !== "\r") { field += c; }
-  }
-  if (field.length || row.length) { row.push(field); rows.push(row); }
-  return rows;
-}
-
-// "9-3-26 7:15 PM" is what the robots write, and new Date() will not take it.
-function labDate(v) {
-  const t = (v || "").trim();
-  if (!t) return null;
-  const m = t.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})(?:[ ,]+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp])?)?/);
-  if (m) {
-    let [, mo, da, yr, hh, mi, ap] = m;
-    yr = +yr; if (yr < 100) yr += 2000;
-    let hour = hh ? +hh : 0;
-    if (ap) { const pm = /p/i.test(ap); if (pm && hour < 12) hour += 12; if (!pm && hour === 12) hour = 0; }
-    return new Date(yr, +mo - 1, +da, hour, mi ? +mi : 0);
-  }
-  const d = new Date(t);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-// Live runs out of the experiment tracker: a row that is not TERMINATED.
-function runningNow(csv) {
-  if (!csv) return [];
-  const rows = parseCSV(csv);
-  if (rows.length < 2) return [];
-  const head = rows[0].map(function (h) { return h.trim().toLowerCase(); });
-  const col = function (name) { return head.indexOf(name.toLowerCase()); };   // first match wins, headers repeat
-  const iStart = col("Start Date"), iRobot = col("RobotID"), iUser = col("User");
-  const iMethod = col("Method"), iFolder = col("Folder Name"), iTerm = col("TERMINATED");
-  if (iRobot < 0) return [];
-  const out = [];
-  for (let r = rows.length - 1; r > 0 && out.length < STATUS_MAX_ROWS * 3; r--) {
-    const row = rows[r];
-    if (!row || !row.length) continue;
-    const robot = (row[iRobot] || "").trim();
-    if (!robot) continue;
-    const term = iTerm >= 0 ? (row[iTerm] || "").trim() : "";
-    if (term && !/^(no|false|0)$/i.test(term)) continue;               // anything in TERMINATED means finished
-    const started = iStart >= 0 ? labDate(row[iStart]) : null;
-    out.push({
-      robot: robot,
-      user: iUser >= 0 ? (row[iUser] || "").trim() : "",
-      method: iMethod >= 0 ? (row[iMethod] || "").trim() : "",
-      folder: iFolder >= 0 ? (row[iFolder] || "").trim() : "",
-      started: started,
-      hours: started ? (Date.now() - started.getTime()) / 3600000 : null
-    });
-  }
-  return out.slice(0, STATUS_MAX_ROWS);
-}
-
-// Upcoming reservations out of a public Google Calendar ICS feed.
-function icsDate(v) {
-  const m = (v || "").match(/(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?/);
-  if (!m) return null;
-  const [, y, mo, d, hh, mi, ss, z] = m;
-  if (!hh) return new Date(+y, +mo - 1, +d);
-  return z ? new Date(Date.UTC(+y, +mo - 1, +d, +hh, +mi, +ss))
-           : new Date(+y, +mo - 1, +d, +hh, +mi, +ss);
-}
-
-function upcoming(cals) {
-  const now = Date.now();
-  const out = [];
-  (cals || []).forEach(function (c) {
-    if (!c || !c.ics) return;
-    const raw = c.ics.length > ICS_MAX_CHARS ? c.ics.slice(-ICS_MAX_CHARS) : c.ics;
-    const body = raw.replace(/\r\n[ \t]/g, "");                        // unfold wrapped ICS lines
-    body.split("BEGIN:VEVENT").slice(1).forEach(function (chunk) {
-      if (/RRULE:/.test(chunk)) return;                                // repeating events are not reservations here
-      const start = icsDate((chunk.match(/\nDTSTART[^:]*:([^\r\n]+)/) || [])[1]);
-      const end = icsDate((chunk.match(/\nDTEND[^:]*:([^\r\n]+)/) || [])[1]);
-      const summary = ((chunk.match(/\nSUMMARY:([^\r\n]*)/) || [])[1] || "").trim();
-      if (!start) return;
-      const finish = end ? end.getTime() : start.getTime() + 3600000;  // no DTEND, assume an hour
-      if (finish <= now) return;                                       // over and done with
-      out.push({ robot: c.name, start: start, end: end, summary: summary,
-                 active: start.getTime() <= now });                    // reserved and already under way
-    });
-  });
-  out.sort(function (a, b) { return a.start - b.start; });
-  return out.slice(0, STATUS_MAX_ROWS);
-}
-
 // Columns are camera families: "Olivia" sits above "Olivia (Liquids)", one family per column.
 function layoutForCameras(cams) {
   const groups = [];
@@ -260,7 +163,8 @@ function buildWall(cams) {
     "border:1px solid rgba(255,255,255,.2);border-radius:3px;padding:2px 6px;color:#fff;" +
     "font-family:ui-monospace,Menlo,monospace;font-size:12px;}" +
     "#nw-grid{position:fixed;inset:0;display:grid;gap:2px;background:#222;z-index:2147483646;}" +
-    "#nw-grid .nw-tile{position:relative;overflow:hidden;background:#000;}" +
+    "#nw-grid .nw-tile{position:relative;overflow:hidden;background:#0b0f1a;}" +
+    "#nw-grid .nw-tile iframe{background:#0b0f1a;}" +
     "#nw-grid .nw-stage{position:absolute;left:50%;top:50%;overflow:hidden;}" +
     "#nw-grid .nw-tile iframe{position:absolute;border:0;transform-origin:0 0;}" +
     "#nw-grid .nw-rot{position:absolute;right:10px;bottom:10px;z-index:6;cursor:pointer;" +
@@ -347,7 +251,12 @@ function buildWall(cams) {
     const stage = document.createElement("div");                      // the thing that rotates, the frame sits inside it
     stage.className = "nw-stage";
     const frame = document.createElement("iframe");
-    frame.src = "/";                                                  // all frames load at once, this worked best
+    frame.style.background = "#0b0f1a";                               // the iframe's own white is what used to flash
+    if (LOAD_STAGGER_MS) {                                            // all at once still, just not the same millisecond
+      setTimeout(function () { frame.src = "/"; }, layout.placed.indexOf(slot) * LOAD_STAGGER_MS);
+    } else {
+      frame.src = "/";
+    }
     frame.width = FRAME_W;
     frame.height = FRAME_H;
     frame.allow = "autoplay; fullscreen";
@@ -786,13 +695,17 @@ function buildWall(cams) {
   }
 
   function renderStatusInner(data) {
-    const runs = runningNow(data && data.csv);
-    const next = upcoming(data && data.cals);
+    const runs = (data && data.runs) || [];
+    const next = ((data && data.reservations) || []).map(function (e) {
+      return { robot: e.robot, summary: e.summary, active: e.active,  // dates arrive as strings over the message channel
+               start: e.start ? new Date(e.start) : null,
+               end: e.end ? new Date(e.end) : null };
+    });
     const esc = function (t) { const d = document.createElement("div"); d.textContent = t; return d.innerHTML; };
 
     let html = "<div class='nw-sect'><h3>Running now</h3>";
     if (!runs.length) {
-      html += "<div class='nw-none'>" + (data && data.csv ? "Nothing running" : "Tracker unavailable") + "</div>";
+      html += "<div class='nw-none'>" + (data && data.haveTracker ? "Nothing running" : "Tracker unavailable") + "</div>";
     } else {
       runs.forEach(function (r) {
         const bits = [r.method, r.user ? "run by " + r.user : "",
