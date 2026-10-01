@@ -753,17 +753,31 @@ function buildWall(cams) {
                 "</div></div>";
       });
     }
-    html += "</div><div class='nw-sect'><h3>Reserved next</h3>";
-    if (!next.length) {
-      html += "<div class='nw-none'>Nothing reserved</div>";
-    } else {
-      next.forEach(function (e) {
-        const when = e.active
-          ? "in progress" + (e.end ? ", until " + fmtWhen(e.end) : "")
-          : fmtWhen(e.start);
-        html += "<div class='nw-item' style='border-left-color:" + (e.active ? "#7fb2e5" : "#4b5f85") + "'>" +
+    html += "</div>";
+
+    const active = next.filter(function (e) { return e.active; });    // reserved and under way, but nothing running
+    const later = next.filter(function (e) { return !e.active; });
+
+    if (active.length) {                                              // its own section, only when there is one
+      html += "<div class='nw-sect'><h3>In progress</h3>";
+      active.forEach(function (e) {
+        const when = e.end ? "until " + fmtWhen(e.end) : "started";
+        html += "<div class='nw-item' style='border-left-color:#7fb2e5'>" +
                 "<div class='nw-t'>" + esc(e.robot) + "</div>" +
                 "<div class='nw-m'>" + esc(when) + (e.summary ? " \u00b7 " + esc(e.summary) : "") +
+                "</div></div>";
+      });
+      html += "</div>";
+    }
+
+    html += "<div class='nw-sect'><h3>Reserved next</h3>";
+    if (!later.length) {
+      html += "<div class='nw-none'>Nothing reserved</div>";
+    } else {
+      later.forEach(function (e) {
+        html += "<div class='nw-item' style='border-left-color:#4b5f85'>" +
+                "<div class='nw-t'>" + esc(e.robot) + "</div>" +
+                "<div class='nw-m'>" + esc(fmtWhen(e.start)) + (e.summary ? " \u00b7 " + esc(e.summary) : "") +
                 "</div></div>";
       });
     }
