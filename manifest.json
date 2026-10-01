@@ -35,5 +35,9 @@
   },
   "permissions": [
     "tabs"
+  ],
+  "host_permissions": [
+    "https://docs.google.com/*",
+    "https://calendar.google.com/*"
   ]
 }

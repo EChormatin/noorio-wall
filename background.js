@@ -51,5 +51,41 @@ async function openWall(tab) {
   catch (e) { log("could not mute the tab", e && e.message); }
 }
 
+// The wall asks for lab status: the experiment tracker (public CSV) and the three robot
+// calendars (public ICS). Fetching happens here because the content script is on
+// webclient.noorio.com and these are other origins.
+const TRACKER_CSV = "https://docs.google.com/spreadsheets/d/" +
+  "1ffdqsKGGs3LSMRTHdqywheSt4YHwDCQ5NNCwR864B4g/export?format=csv&gid=0";
+const ROBOT_CALENDARS = [                                             // same ids the equipment page uses
+  { name: "Benjamin", id: "7bcbfb37f83965ebe68f6ccccd0191812829dd06eb3d14f32ab8d6599837483e@group.calendar.google.com" },
+  { name: "Meredith", id: "1f7fd0a3d234e9c0b101ff14d25c122038c8e8d6a0b1937f40cfbcf307b6d1c7@group.calendar.google.com" },
+  { name: "Olivia",   id: "e987a5ca5aa6595efea1060bd491567917853669a33fe192f578d3bdce77bbc0@group.calendar.google.com" }
+];
+
+async function textOrNull(url) {
+  try {
+    const r = await fetch(url, { credentials: "omit" });
+    if (!r.ok) { log("fetch failed", r.status, url); return null; }
+    return await r.text();
+  } catch (e) { log("fetch threw", e && e.message, url); return null; }
+}
+
+async function labStatus() {
+  const csv = await textOrNull(TRACKER_CSV);
+  const cals = await Promise.all(ROBOT_CALENDARS.map(async function (c) {
+    const ics = await textOrNull("https://calendar.google.com/calendar/ical/" +
+                                 encodeURIComponent(c.id) + "/public/basic.ics");
+    return { name: c.name, ics: ics };
+  }));
+  return { csv: csv, cals: cals, at: Date.now() };
+}
+
+chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+  if (msg && msg.action === "labStatus") {
+    labStatus().then(sendResponse);
+    return true;                                                      // keep the channel open for the async reply
+  }
+});
+
 chrome.action.onClicked.addListener(openWall);                        // the toolbar button is the only way in
 

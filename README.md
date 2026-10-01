@@ -79,6 +79,20 @@ Noorio pops up a "long duration streaming will drain the battery" dialog every s
 watches for it, ticks "No more pop-up prompts" and presses Continue on its own, so the feeds keep
 running unattended. If you ever want that back, set AUTO_CONTINUE to false in `content.js`.
 
+## Rotating a camera
+
+Hover a tile and a small Rotate control appears in its bottom right. Each click turns that camera
+another 90 degrees, and the choice is remembered per camera, so a sideways-mounted camera stays
+upright next time you open the wall.
+
+## The status panel
+
+When the grid has a gap, which happens when one robot family has fewer cameras than another, the
+empty cell shows what is running now and what is reserved next, the same information as the rail on
+chorylab.com/equipment. Running runs come from the experiment tracker sheet, reservations from the
+three robot calendars, both read without signing in. It refreshes every three minutes. Set
+SHOW_STATUS_PANEL to false in `content.js` to leave the cell empty instead.
+
 ## Camera photos
 
 Each label shows a small photo next to the camera name. They live in `avatars.js`, keyed by the

@@ -23,6 +23,10 @@ const AUTO_CONTINUE = true;       // dismiss Noorio's "long duration streaming" 
 const CONTINUE_LABELS = ["Continue", "continue"];        // the keep-streaming button
 const SUPPRESS_LABEL = "No more pop-up prompts";         // the checkbox that stops the dialog coming back
 const DIALOG_CHECK_EVERY = 3;     // run the dialog scan every Nth tick, it walks the frame DOM
+const SHOW_STATUS_PANEL = true;   // fill an empty grid cell with what is running and what is reserved
+const STATUS_REFRESH_MS = 180000; // re-ask the background for lab status every three minutes
+const STATUS_MAX_ROWS = 3;        // keep the panel small, it has to fit one tile
+const ROTATE_STORE = "nw-rotation";   // localStorage key holding {cameraName: degrees}
 const MUTE_ALL = true;            // mute every media element in every frame
 const CLICK_SOUND_BUTTON = true;  // also press Noorio's own speaker control so its icon shows muted
 const SOUND_CLICK_MAX = 2;        // cap, so a misread icon cannot toggle back and forth            // muted video may autoplay, unmuted may not
@@ -88,6 +92,99 @@ function readDeviceNames(doc) {
     if (groups[cls].length > best.length) best = groups[cls];         // the class used by every camera card
   });
   return best;
+}
+
+// Minimal CSV reader: quoted fields, doubled quotes, commas and newlines inside quotes.
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; }
+      else field += c;
+    } else if (c === '"') { quoted = true; }
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c !== "\r") { field += c; }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// "9-3-26 7:15 PM" is what the robots write, and new Date() will not take it.
+function labDate(v) {
+  const t = (v || "").trim();
+  if (!t) return null;
+  const m = t.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})(?:[ ,]+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp])?)?/);
+  if (m) {
+    let [, mo, da, yr, hh, mi, ap] = m;
+    yr = +yr; if (yr < 100) yr += 2000;
+    let hour = hh ? +hh : 0;
+    if (ap) { const pm = /p/i.test(ap); if (pm && hour < 12) hour += 12; if (!pm && hour === 12) hour = 0; }
+    return new Date(yr, +mo - 1, +da, hour, mi ? +mi : 0);
+  }
+  const d = new Date(t);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// Live runs out of the experiment tracker: a row that is not TERMINATED.
+function runningNow(csv) {
+  if (!csv) return [];
+  const rows = parseCSV(csv);
+  if (rows.length < 2) return [];
+  const head = rows[0].map(function (h) { return h.trim().toLowerCase(); });
+  const col = function (name) { return head.indexOf(name.toLowerCase()); };   // first match wins, headers repeat
+  const iStart = col("Start Date"), iRobot = col("RobotID"), iUser = col("User");
+  const iMethod = col("Method"), iFolder = col("Folder Name"), iTerm = col("TERMINATED");
+  if (iRobot < 0) return [];
+  const out = [];
+  for (let r = rows.length - 1; r > 0 && out.length < STATUS_MAX_ROWS * 3; r--) {
+    const row = rows[r];
+    if (!row || !row.length) continue;
+    const robot = (row[iRobot] || "").trim();
+    if (!robot) continue;
+    const term = iTerm >= 0 ? (row[iTerm] || "").trim() : "";
+    if (term && !/^(no|false|0)$/i.test(term)) continue;               // anything in TERMINATED means finished
+    const started = iStart >= 0 ? labDate(row[iStart]) : null;
+    out.push({
+      robot: robot,
+      user: iUser >= 0 ? (row[iUser] || "").trim() : "",
+      method: iMethod >= 0 ? (row[iMethod] || "").trim() : "",
+      folder: iFolder >= 0 ? (row[iFolder] || "").trim() : "",
+      started: started,
+      hours: started ? (Date.now() - started.getTime()) / 3600000 : null
+    });
+  }
+  return out.slice(0, STATUS_MAX_ROWS);
+}
+
+// Upcoming reservations out of a public Google Calendar ICS feed.
+function icsDate(v) {
+  const m = (v || "").match(/(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?/);
+  if (!m) return null;
+  const [, y, mo, d, hh, mi, ss, z] = m;
+  if (!hh) return new Date(+y, +mo - 1, +d);
+  return z ? new Date(Date.UTC(+y, +mo - 1, +d, +hh, +mi, +ss))
+           : new Date(+y, +mo - 1, +d, +hh, +mi, +ss);
+}
+
+function upcoming(cals) {
+  const now = Date.now();
+  const out = [];
+  (cals || []).forEach(function (c) {
+    if (!c || !c.ics) return;
+    const body = c.ics.replace(/\r\n[ \t]/g, "");                     // unfold wrapped ICS lines
+    body.split("BEGIN:VEVENT").slice(1).forEach(function (chunk) {
+      if (/RRULE:/.test(chunk)) return;                                // repeating events are not reservations here
+      const start = icsDate((chunk.match(/\nDTSTART[^:]*:([^\r\n]+)/) || [])[1]);
+      const summary = ((chunk.match(/\nSUMMARY:([^\r\n]*)/) || [])[1] || "").trim();
+      if (!start || start.getTime() < now) return;
+      out.push({ robot: c.name, start: start, summary: summary });
+    });
+  });
+  out.sort(function (a, b) { return a.start - b.start; });
+  return out.slice(0, STATUS_MAX_ROWS);
 }
 
 // Columns are camera families: "Olivia" sits above "Olivia (Liquids)", one family per column.
@@ -157,7 +254,15 @@ function buildWall(cams) {
     "font-family:ui-monospace,Menlo,monospace;font-size:12px;}" +
     "#nw-grid{position:fixed;inset:0;display:grid;gap:2px;background:#222;z-index:2147483646;}" +
     "#nw-grid .nw-tile{position:relative;overflow:hidden;background:#000;}" +
+    "#nw-grid .nw-stage{position:absolute;left:50%;top:50%;overflow:hidden;}" +
     "#nw-grid .nw-tile iframe{position:absolute;border:0;transform-origin:0 0;}" +
+    "#nw-grid .nw-rot{position:absolute;right:10px;bottom:10px;z-index:6;cursor:pointer;" +
+    "display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;" +
+    "background:rgba(13,23,48,.68);border:1px solid rgba(255,255,255,.16);color:#dbe6f6;" +
+    "font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:12.5px;letter-spacing:.02em;" +
+    "opacity:0;transition:opacity .2s;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);}" +
+    "#nw-grid .nw-tile:hover .nw-rot{opacity:1;}" +
+    "#nw-grid .nw-rot.nw-on{opacity:1;color:#fff;border-color:#7fb2e5;}" +
     "#nw-grid .nw-hud{position:absolute;left:14px;top:14px;z-index:5;display:flex;align-items:center;" +
     "gap:12px;padding:6px 22px 6px 6px;border-radius:999px;background:rgba(13,23,48,.74);" +
     "border:1px solid rgba(255,255,255,.16);box-shadow:0 6px 18px rgba(8,15,35,.4);" +
@@ -167,7 +272,18 @@ function buildWall(cams) {
     "#nw-grid .nw-hud.nw-noavatar{padding:10px 22px;}" +
     "#nw-grid .nw-hud img{width:40px;height:40px;border-radius:50%;object-fit:cover;display:block;" +
     "border:1px solid rgba(255,255,255,.28);}" +
-    "#nw-grid.nw-nohud .nw-hud{display:none;}";
+    "#nw-grid.nw-nohud .nw-hud{display:none;}" +
+    "#nw-info{position:relative;overflow:auto;background:#0d1730;padding:18px 18px 14px;" +
+    "font-family:'Jost','Century Gothic','Futura',sans-serif;color:#ccd8ec;}" +
+    "#nw-info h3{margin:0 0 8px;font-size:12.5px;font-weight:500;letter-spacing:.14em;" +
+    "text-transform:uppercase;color:#7fb2e5;}" +
+    "#nw-info .nw-sect{margin-bottom:16px;}" +
+    "#nw-info .nw-item{border-left:3px solid #1272b8;padding:2px 0 2px 10px;margin-bottom:10px;}" +
+    "#nw-info .nw-t{font-size:15px;color:#fff;font-weight:500;display:flex;align-items:center;gap:7px;}" +
+    "#nw-info .nw-dot{width:8px;height:8px;border-radius:50%;background:#3fbf6f;flex:none;}" +
+    "#nw-info .nw-m{font-size:13px;color:#9fb0cc;line-height:1.45;margin-top:2px;}" +
+    "#nw-info .nw-none{font-size:13px;color:#8294b3;font-style:italic;}" +
+    "#nw-info .nw-foot{font-size:11.5px;color:#6b7d9c;letter-spacing:.02em;}";
   document.documentElement.appendChild(style);
 
   let bar = document.getElementById("nw-bar");
@@ -221,11 +337,14 @@ function buildWall(cams) {
     tile.className = "nw-tile";
     tile.style.gridColumn = String(slot.col);                         // family column, so pairs stay stacked
     tile.style.gridRow = String(slot.row);
+    const stage = document.createElement("div");                      // the thing that rotates, the frame sits inside it
+    stage.className = "nw-stage";
     const frame = document.createElement("iframe");
     frame.src = "/";                                                  // all frames load at once, this worked best
     frame.width = FRAME_W;
     frame.height = FRAME_H;
     frame.allow = "autoplay; fullscreen";
+    stage.appendChild(frame);
     const hud = document.createElement("div");
     hud.className = "nw-hud";
     const avatarSrc = (typeof NW_AVATARS === "object" && NW_AVATARS) ? NW_AVATARS[name.split(" ")[0]] : null;
@@ -241,10 +360,17 @@ function buildWall(cams) {
     const hudText = document.createElement("span");
     hudText.textContent = name + ": loading";
     hud.appendChild(hudText);
-    tile.appendChild(frame);
+    const rot = document.createElement("div");
+    rot.className = "nw-rot";
+    rot.title = "Rotate this camera";
+    rot.addEventListener("click", function (e) { e.stopPropagation(); rotatePane(name); });
+
+    tile.appendChild(stage);
     tile.appendChild(hud);
+    tile.appendChild(rot);
     grid.appendChild(tile);
-    return { name: name, tile: tile, frame: frame, hud: hud, hudText: hudText,
+    return { name: name, tile: tile, stage: stage, frame: frame, hud: hud, hudText: hudText, rot: rot,
+             rotation: loadRotation(name),
              state: "loading",                                        // loading -> selecting -> starting -> live, retried on timeout
              turnStarted: Date.now(), cropped: false,
              lastTime: -1, lastAdvance: 0, everPlayed: false,
@@ -437,13 +563,50 @@ function buildWall(cams) {
     return true;
   }
 
+  function loadRotation(name) {
+    try { return (JSON.parse(localStorage.getItem(ROTATE_STORE) || "{}")[name] | 0) % 360; }
+    catch (e) { return 0; }
+  }
+
+  function saveRotation(name, deg) {
+    try {
+      const all = JSON.parse(localStorage.getItem(ROTATE_STORE) || "{}");
+      if (deg) all[name] = deg; else delete all[name];
+      localStorage.setItem(ROTATE_STORE, JSON.stringify(all));
+    } catch (e) { log("could not save rotation", e && e.message); }
+  }
+
+  function rotatePane(name) {
+    const p = panes.filter(function (x) { return x.name === name; })[0];
+    if (!p) return;
+    p.rotation = (p.rotation + 90) % 360;
+    saveRotation(name, p.rotation);
+    log("rotated", name, "to", p.rotation);
+    layoutStage(p);
+    crop(p);
+  }
+
+  function layoutStage(p) {                                           // size the stage to the tile, swapped when on its side
+    const tw = p.tile.clientWidth, th = p.tile.clientHeight;
+    const turned = (p.rotation === 90 || p.rotation === 270);
+    const sw = turned ? th : tw;                                      // the stage is what the video fills
+    const sh = turned ? tw : th;
+    p.stage.style.width = sw + "px";
+    p.stage.style.height = sh + "px";
+    p.stage.style.transform = "translate(-50%, -50%) rotate(" + p.rotation + "deg)";
+    p.rot.textContent = p.rotation ? "Rotate " + p.rotation + "\u00b0" : "Rotate";
+    p.rot.classList.toggle("nw-on", !!p.rotation);
+    return { w: sw, h: sh };
+  }
+
   function crop(p) {
     const doc = p.frame.contentDocument;
     const vid = media(doc);
     if (!vid) return false;
     const r = vid.getBoundingClientRect();
     if (r.width < 120 || r.height < 90) return false;
-    const tw = p.tile.clientWidth, th = p.tile.clientHeight;
+    const dims = layoutStage(p);                                      // rotation changes which side the video fills
+    const tw = dims.w, th = dims.h;
     const s = FIT === "cover" ? Math.max(tw / r.width, th / r.height) : Math.min(tw / r.width, th / r.height);
     p.frame.style.transform = "scale(" + s + ")";
     p.frame.style.left = (-r.left * s + (FIT === "cover" ? (tw - r.width * s) / 2 : 0)) + "px";
@@ -561,6 +724,82 @@ function buildWall(cams) {
     if (t !== p.lastTime) { p.lastTime = t; p.lastAdvance = Date.now(); return; }
     if (Date.now() - p.lastAdvance > STALL_SECONDS * 1000) reloadPane(p, "stalled");
   }
+
+  let infoBox = null;
+  if (SHOW_STATUS_PANEL) {
+    const taken = {};
+    layout.placed.forEach(function (sl) { taken[sl.col + ":" + sl.row] = true; });
+    let slot = null;
+    for (let r = 1; r <= rows && !slot; r++) {
+      for (let c = 1; c <= cols && !slot; c++) { if (!taken[c + ":" + r]) slot = { col: c, row: r }; }
+    }
+    if (slot) {                                                       // only when the grid actually has a gap
+      infoBox = document.createElement("div");
+      infoBox.id = "nw-info";
+      infoBox.style.gridColumn = String(slot.col);
+      infoBox.style.gridRow = String(slot.row);
+      infoBox.innerHTML = "<div class='nw-sect'><h3>Running now</h3>" +
+                          "<div class='nw-none'>checking...</div></div>";
+      grid.appendChild(infoBox);
+      log("status panel placed at column " + slot.col + ", row " + slot.row);
+    }
+  }
+
+  function fmtWhen(d) {
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    if (sameDay) return "today " + time;
+    const tom = new Date(now.getTime() + 86400000);
+    if (d.toDateString() === tom.toDateString()) return "tomorrow " + time;
+    return d.toLocaleDateString([], { weekday: "short", month: "numeric", day: "numeric" }) + " " + time;
+  }
+
+  function renderStatus(data) {
+    if (!infoBox) return;
+    const runs = runningNow(data && data.csv);
+    const next = upcoming(data && data.cals);
+    const esc = function (t) { const d = document.createElement("div"); d.textContent = t; return d.innerHTML; };
+
+    let html = "<div class='nw-sect'><h3>Running now</h3>";
+    if (!runs.length) {
+      html += "<div class='nw-none'>" + (data && data.csv ? "Nothing running" : "Tracker unavailable") + "</div>";
+    } else {
+      runs.forEach(function (r) {
+        const bits = [r.method, r.user ? "run by " + r.user : "",
+                      r.hours != null ? r.hours.toFixed(1) + "h elapsed" : ""].filter(Boolean);
+        html += "<div class='nw-item'><div class='nw-t'><span class='nw-dot'></span>" + esc(r.robot) + "</div>" +
+                "<div class='nw-m'>" + esc(bits.join(" \u00b7 ")) + (r.folder ? "<br>" + esc(r.folder) : "") +
+                "</div></div>";
+      });
+    }
+    html += "</div><div class='nw-sect'><h3>Reserved next</h3>";
+    if (!next.length) {
+      html += "<div class='nw-none'>Nothing reserved</div>";
+    } else {
+      next.forEach(function (e) {
+        html += "<div class='nw-item' style='border-left-color:#4b5f85'>" +
+                "<div class='nw-t'>" + esc(e.robot) + "</div>" +
+                "<div class='nw-m'>" + esc(fmtWhen(e.start)) + (e.summary ? " \u00b7 " + esc(e.summary) : "") +
+                "</div></div>";
+      });
+    }
+    html += "</div><div class='nw-foot'>updated " +
+            new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + "</div>";
+    infoBox.innerHTML = html;
+  }
+
+  function refreshStatus() {
+    if (!infoBox) return;
+    try {
+      chrome.runtime.sendMessage({ action: "labStatus" }, function (data) {
+        if (chrome.runtime.lastError) { log("status fetch failed", chrome.runtime.lastError.message); return; }
+        renderStatus(data);
+      });
+    } catch (e) { log("status request threw", e && e.message); }
+  }
+
+  if (infoBox) { refreshStatus(); setInterval(refreshStatus, STATUS_REFRESH_MS); }
 
   let discovered = !AUTO_DISCOVER;                                    // skip if discovery is switched off
   function tryDiscover() {
@@ -694,8 +933,10 @@ function buildWall(cams) {
   });
 
   window.addEventListener("resize", function () {
-    panes.forEach(function (p) { if (p.cropped) crop(p); });
+    panes.forEach(function (p) { layoutStage(p); if (p.cropped) crop(p); });
   });
+
+  panes.forEach(layoutStage);                                         // apply any saved rotation straight away
 
   if (RELOAD_MINUTES > 0) {
     panes.forEach(function (p, i) {
