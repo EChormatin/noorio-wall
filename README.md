@@ -94,6 +94,15 @@ not just ones that start later. Running runs come from the experiment tracker sh
 three robot calendars, both read without signing in. It refreshes every three minutes. Set
 SHOW_STATUS_PANEL to false in `content.js` to leave the cell empty instead.
 
+## Running it for days
+
+Four video streams left alone will slowly fill the tab's memory until Chrome kills it with
+"Aw, Snap!". Each tile therefore replaces its frame every 30 minutes, staggered so only one is ever
+reloading, which drops the old stream entirely. A tile that is playing is also checked far less
+often than one still starting, which is most of the CPU the wall uses.
+
+RECYCLE_MINUTES in `content.js` controls how often, and 0 turns it off.
+
 ## The status panel position
 
 When the camera families are uneven, so the grid has a spare cell, the panel goes in that cell.

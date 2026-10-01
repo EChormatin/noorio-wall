@@ -16,7 +16,8 @@ const FIT = "cover";              // "cover" fills the tile and crops, "contain"
 const START_TIMEOUT_MS = 40000;   // reload a tile that has not started within this, retries often succeed
 const STALL_SECONDS = 60;         // reload a live tile if its clock stops advancing this long
 const STALL_GRACE_MS = 25000;     // ignore stall checks this long after a frame loads
-const RELOAD_MINUTES = 0;         // periodic refresh per tile, 0 disables. Sequential start makes this risky, leave off unless needed
+const RECYCLE_MINUTES = 30;       // replace each tile's frame this often, so a day-long stream cannot eat the tab
+const RECYCLE_SPREAD = true;      // offset the recycles so only one tile is ever reloading
 const RELOAD_COOLDOWN_MS = 45000; // never reload the same tile more often than this
 const PLAY_CLICK_INTERVAL_MS = 2000;  // once a play button exists, retry it this often until the video runs
 const PLAY_CLICK_MAX = 15;            // plenty of attempts, the button often appears late
@@ -37,14 +38,17 @@ const ROTATE_STORE = "nw-rotation";   // localStorage key holding {cameraName: d
 const MUTE_ALL = true;            // mute every media element in every frame
 const CLICK_SOUND_BUTTON = true;  // also press Noorio's own speaker control so its icon shows muted
 const SOUND_CLICK_MAX = 2;        // cap, so a misread icon cannot toggle back and forth            // muted video may autoplay, unmuted may not
-const POLL_MS = 1200;             // main loop interval
+const POLL_MS = 1200;             // main loop interval while a tile is still coming up
+const LIVE_POLL_MS = 6000;        // a tile that is playing needs far less checking, and this is most of the CPU
+const MAX_ERR_CHARS = 200;        // lastErr is appended to, so cap it or it grows all day
 const SHOW_BANNER = true;         // Chory Lab header bar across the top, B toggles
 const BANNER_H = 46;              // header height in pixels
 const BANNER_TITLE = "Robot Cameras";   // text next to the wordmark
 const SHOW_HUD = true;            // per-tile labels, L toggles
 const DEBUG = true;               // console logging
 
-var WALL_GEN = 0;                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
+var WALL_GEN = 0;
+var NW_TIMERS = [];               // every interval the wall owns, so a rebuild can stop them                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
 
 if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); }
 
@@ -53,11 +57,48 @@ if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); 
 // document_idle meant staring at Noorio's white shell while its app booted.
 function bootWall() {
   paintBackdrop();
+  const go = function () {
+    try { startWall(); }
+    catch (e) { bootFail((e && e.message) || String(e)); throw e; }   // never leave a blank navy page
+  };
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", startWall, { once: true });
+    document.addEventListener("DOMContentLoaded", go, { once: true });
   } else {
-    startWall();
+    go();
   }
+  setTimeout(function () {                                            // nothing on screen after this means it failed quietly
+    if (!document.getElementById("nw-grid")) bootFail("the wall did not finish starting");
+  }, 25000);
+}
+
+function bootFail(message) {
+  log("boot failed:", message);
+  let boot = document.getElementById("nw-boot");
+  if (!boot) {
+    boot = document.createElement("div");
+    boot.id = "nw-boot";
+    (document.body || document.documentElement).appendChild(boot);
+  }
+  boot.textContent = "";
+  boot.style.flexDirection = "column";
+  boot.style.gap = "14px";
+  boot.style.textTransform = "none";
+  boot.style.color = "#ccd8ec";
+  boot.style.padding = "24px";
+  boot.style.textAlign = "center";
+
+  const h = document.createElement("div");
+  h.textContent = "The camera wall did not start";
+  h.style.cssText = "font-size:20px;color:#fff;letter-spacing:.01em;";
+  const why = document.createElement("div");
+  why.textContent = message || "unknown error";
+  why.style.cssText = "font-size:13px;color:#8294b3;max-width:520px;";
+  const again = document.createElement("button");
+  again.textContent = "Reload";
+  again.style.cssText = "font:inherit;font-size:14px;cursor:pointer;background:#1272b8;color:#fff;" +
+                        "border:1px solid #1272b8;border-radius:2px;padding:9px 20px;letter-spacing:.02em;";
+  again.onclick = function () { location.reload(); };
+  [h, why, again].forEach(function (el) { boot.appendChild(el); });
 }
 
 function paintBackdrop() {
@@ -320,16 +361,12 @@ function buildWall(cams) {
     tile.style.gridRow = String(slot.row);
     const stage = document.createElement("div");                      // the thing that rotates, the frame sits inside it
     stage.className = "nw-stage";
-    const frame = document.createElement("iframe");
-    frame.style.background = "#0b0f1a";                               // the iframe's own white is what used to flash
+    const frame = makeFrame();
     if (LOAD_STAGGER_MS) {                                            // all at once still, just not the same millisecond
       setTimeout(function () { frame.src = "/"; }, layout.placed.indexOf(slot) * LOAD_STAGGER_MS);
     } else {
       frame.src = "/";
     }
-    frame.width = FRAME_W;
-    frame.height = FRAME_H;
-    frame.allow = "autoplay; fullscreen";
     stage.appendChild(frame);
     const hud = document.createElement("div");
     hud.className = "nw-hud";
@@ -360,7 +397,8 @@ function buildWall(cams) {
              state: "loading",                                        // loading -> selecting -> starting -> live, retried on timeout
              turnStarted: Date.now(), cropped: false,
              lastTime: -1, lastAdvance: 0, everPlayed: false,
-             playClicks: 0, lastPlayClick: 0, lastReload: 0, soundClicks: 0, lastErr: "" };
+             playClicks: 0, lastPlayClick: 0, lastReload: 0, soundClicks: 0, lastErr: "",
+             recycleAt: 0 };
   });
 
 
@@ -441,10 +479,10 @@ function buildWall(cams) {
     const how = invokeFrameworkHandler(target, doc.body);             // preferred: call the handler, do not fake an event
     if (how) {
       log("invoked", how, "handler for", p.name);
-      p.lastErr = (p.lastErr || "") + " [handler:" + how + "]";
+      p.lastErr = ((p.lastErr || "") + " [handler:" + how + "]").slice(-MAX_ERR_CHARS);
     } else {
       log("no framework handler found, dispatching events for", p.name, target.tagName, target.className);
-      p.lastErr = (p.lastErr || "") + " [no handler, dispatched]";
+      p.lastErr = ((p.lastErr || "") + " [no handler, dispatched]").slice(-MAX_ERR_CHARS);
       realClick(p.frame.contentWindow, target);
     }
   }
@@ -547,6 +585,15 @@ function buildWall(cams) {
     log("dismissing the streaming reminder for", p.name);
     if (!invokeFrameworkHandler(cont, doc.body)) realClick(p.frame.contentWindow, cont);
     return true;
+  }
+
+  function makeFrame() {                                              // one fresh element per load, so old documents are dropped
+    const f = document.createElement("iframe");
+    f.width = FRAME_W;
+    f.height = FRAME_H;
+    f.allow = "autoplay; fullscreen";
+    f.style.background = "#0b0f1a";                                   // the iframe's own white is what used to flash
+    return f;
   }
 
   function applySavedRotations() {                                    // extension storage survives anything the app does
@@ -692,6 +739,10 @@ function buildWall(cams) {
     p.lastAdvance = Date.now();
     p.hudText.textContent = p.name;
     clearHint(p);
+    if (RECYCLE_MINUTES > 0 && !p.recycleAt) {                        // stale frames are what fill the tab up
+      const spread = RECYCLE_SPREAD ? (panes.indexOf(p) * RECYCLE_MINUTES * 60000 / Math.max(1, panes.length)) : 0;
+      p.recycleAt = Date.now() + RECYCLE_MINUTES * 60000 + spread;
+    }
   }
 
   function reloadPane(p, why) {
@@ -700,13 +751,23 @@ function buildWall(cams) {
     log("reloading", p.name, "because", why);
     p.hudText.textContent = p.name + ": " + why;
     p.state = "loading"; p.cropped = false; p.playClicks = 0; p.soundClicks = 0;
-    p.lastTime = -1; p.everPlayed = false;
+    p.lastTime = -1; p.everPlayed = false; p.lastErr = "";
     p.turnStarted = Date.now();
-    p.frame.style.transform = ""; p.frame.style.left = ""; p.frame.style.top = "";
-    p.frame.src = "/";
+    p.recycleAt = 0;
+
+    const fresh = makeFrame();                                        // a new element, so the old document is dropped
+    try { p.stage.replaceChild(fresh, p.frame); }
+    catch (e) { p.stage.appendChild(fresh); }
+    p.frame = fresh;
+    fresh.src = "/";
   }
 
   function maintain(p) {                                              // keep an already-live tile healthy
+    if (p.recycleAt && Date.now() > p.recycleAt) {                    // scheduled recycle, one tile at a time
+      p.lastReload = 0;
+      reloadPane(p, "refreshing");
+      return;
+    }
     const doc = doc_of(p);
     if (!doc || !doc.body) return;
     if (looksSignedOut(doc)) { p.state = "signedout"; p.hudText.textContent = p.name + ": signed out"; showSignedOut(); return; }
@@ -861,7 +922,7 @@ function buildWall(cams) {
   if (infoBox) {                                                      // cameras first, status after they settle
     setTimeout(function () {
       refreshStatus();
-      setInterval(refreshStatus, STATUS_REFRESH_MS);
+      NW_TIMERS.push(setInterval(refreshStatus, STATUS_REFRESH_MS));
     }, STATUS_FIRST_DELAY_MS);
   }
 
@@ -886,6 +947,7 @@ function buildWall(cams) {
   function tick() {
     if (gen !== WALL_GEN) return;                                     // a newer wall has taken over
     tickCount++;
+    const slowPass = (tickCount % Math.max(1, Math.round(LIVE_POLL_MS / POLL_MS))) !== 0;
     if (!discovered && tickCount % 4 === 0) tryDiscover();
     const scanDialogs = AUTO_CONTINUE && (tickCount % DIALOG_CHECK_EVERY === 0);
     panes.forEach(function (p) {
@@ -896,7 +958,7 @@ function buildWall(cams) {
           try { muteEverything(doc); muteViaPlayerButton(p, doc); } catch (e) { log("mute pass failed", e && e.message); }
         }
       }
-      if (p.state === "live") maintain(p);
+      if (p.state === "live") { if (!slowPass) maintain(p); }         // playing tiles are checked every LIVE_POLL_MS
       else if (p.state === "signedout") {                             // recover by itself once a session exists again
         const d = doc_of(p);
         if (d && d.body && !looksSignedOut(d)) {
@@ -1003,24 +1065,9 @@ function buildWall(cams) {
   panes.forEach(layoutStage);
   applySavedRotations();                                              // bring back each camera's saved angle
 
-  if (RELOAD_MINUTES > 0) {
-    panes.forEach(function (p, i) {
-      setTimeout(function () {
-        setInterval(function () { reloadPane(p, "scheduled refresh"); }, RELOAD_MINUTES * 60000);
-      }, i * 30000);
-    });
-  }
-
-  chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
-    if (msg && msg.action === "restart") {                            // toolbar button on an open wall
-      log("restart requested from the toolbar button");
-      panes.forEach(function (p) { p.lastReload = 0; reloadPane(p, "restart"); });
-      sendResponse({ ok: true });
-    }
-    return true;
-  });
-
-  setInterval(tick, POLL_MS);
+  NW_TIMERS.forEach(clearInterval);                                   // a rebuild must not leave the old loops running
+  NW_TIMERS.length = 0;
+  NW_TIMERS.push(setInterval(tick, POLL_MS));
   tick();
 
   log("wall built. D diagnostics, L labels, B banner, F fullscreen, R restart");
