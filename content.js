@@ -27,6 +27,7 @@ const DIALOG_CHECK_EVERY = 3;     // run the dialog scan every Nth tick, it walk
 const SHOW_PROMO = true;          // the "learn more" bar in the bottom right corner
 const PROMO_TEXT = "Learn more about our research at chorylab.com";
 const PROMO_URL = "https://www.chorylab.com";
+const STATUS_RAIL_W = 270;        // width of the left rail when the grid has no spare cell
 const SHOW_STATUS_PANEL = true;   // fill an empty grid cell with what is running and what is reserved
 const STATUS_FIRST_DELAY_MS = 20000;  // leave the cameras alone while they start, then fetch lab status
 const STATUS_REFRESH_MS = 180000; // re-ask the background for lab status every three minutes
@@ -45,7 +46,34 @@ const DEBUG = true;               // console logging
 
 var WALL_GEN = 0;                 // var, not let: hoisted, so load order can never put it in a temporal dead zone
 
-if (window.top === window.self && /wallGrid/.test(location.hash)) { startWall(); }
+if (window.top === window.self && /wallGrid/.test(location.hash)) { bootWall(); }
+
+// Runs at document_start, before Noorio's app has painted anything. Paint our own background
+// immediately, then build the grid as soon as there is a DOM to build it in. Waiting for
+// document_idle meant staring at Noorio's white shell while its app booted.
+function bootWall() {
+  paintBackdrop();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", startWall, { once: true });
+  } else {
+    startWall();
+  }
+}
+
+function paintBackdrop() {
+  const st = document.createElement("style");
+  st.id = "nw-boot-style";
+  st.textContent =
+    "html,body{background:#0d1730 !important;}" +
+    "#nw-boot{position:fixed;inset:0;z-index:2147483646;background:#0d1730;display:flex;" +
+    "align-items:center;justify-content:center;color:#5d7399;letter-spacing:.08em;" +
+    "font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:13px;text-transform:uppercase;}";
+  (document.head || document.documentElement).appendChild(st);
+  const boot = document.createElement("div");
+  boot.id = "nw-boot";
+  boot.textContent = "Chory Lab robot cameras";
+  (document.body || document.documentElement).appendChild(boot);
+}
 
 function startWall() {
   const fromHash = decodeURIComponent((location.hash.match(/cams=([^&]*)/) || [])[1] || "")
@@ -212,7 +240,16 @@ function buildWall(cams) {
     "#nw-info .nw-qr img{width:84px;height:84px;display:block;border-radius:3px;background:#fff;padding:4px;}" +
     "#nw-info .nw-qr .nw-qrtext{min-width:0;}" +
     "#nw-info .nw-qr .nw-qrlabel{font-size:14px;color:#fff;font-weight:500;line-height:1.3;}" +
-    "#nw-info .nw-qr .nw-qrurl{font-size:12px;color:#7fb2e5;margin-top:4px;word-break:break-all;}";
+    "#nw-info .nw-qr .nw-qrurl{font-size:12px;color:#7fb2e5;margin-top:4px;word-break:break-all;}" +
+    "#nw-info.nw-rail{padding:16px 14px 12px;}" +
+    "#nw-info.nw-rail h3{font-size:11.5px;letter-spacing:.12em;}" +
+    "#nw-info.nw-rail .nw-t{font-size:14px;}" +
+    "#nw-info.nw-rail .nw-m{font-size:12px;}" +
+    "#nw-info.nw-rail .nw-sect{margin-bottom:13px;}" +
+    "#nw-info.nw-rail .nw-qr{gap:10px;margin-top:12px;padding-top:12px;}" +
+    "#nw-info.nw-rail .nw-qr img{width:70px;height:70px;}" +
+    "#nw-info.nw-rail .nw-qr .nw-qrlabel{font-size:13px;}" +
+    "#nw-info.nw-rail .nw-qr .nw-qrurl{font-size:11px;}";
   document.documentElement.appendChild(style);
 
   let bar = document.getElementById("nw-bar");
@@ -252,19 +289,34 @@ function buildWall(cams) {
     document.documentElement.appendChild(bar);
   }
 
+  let gapSlot = null;                                                 // a spare cell in the grid, if the families are uneven
+  if (SHOW_STATUS_PANEL) {
+    const taken = {};
+    layout.placed.forEach(function (sl) { taken[sl.col + ":" + sl.row] = true; });
+    for (let r = 1; r <= rows && !gapSlot; r++) {
+      for (let c = 1; c <= cols && !gapSlot; c++) { if (!taken[c + ":" + r]) gapSlot = { col: c, row: r }; }
+    }
+  }
+  const railMode = SHOW_STATUS_PANEL && !gapSlot;                     // every cell is full, so the panel goes beside the grid
+  const colShift = railMode ? 1 : 0;
+
   const grid = document.createElement("div");
   grid.id = "nw-grid";
   if (SHOW_BANNER) grid.style.top = BANNER_H + "px";                  // sit under the header
-  grid.style.gridTemplateColumns = "repeat(" + cols + ", 1fr)";
+  grid.style.gridTemplateColumns = railMode
+    ? STATUS_RAIL_W + "px repeat(" + cols + ", 1fr)"
+    : "repeat(" + cols + ", 1fr)";
   grid.style.gridTemplateRows = "repeat(" + rows + ", 1fr)";
   if (!SHOW_HUD) grid.classList.add("nw-nohud");
   document.documentElement.appendChild(grid);
+  const boot = document.getElementById("nw-boot");
+  if (boot) boot.remove();                                            // grid is on screen, holding card no longer needed
 
   const panes = layout.placed.map(function (slot) {
     const name = slot.name;
     const tile = document.createElement("div");
     tile.className = "nw-tile";
-    tile.style.gridColumn = String(slot.col);                         // family column, so pairs stay stacked
+    tile.style.gridColumn = String(slot.col + colShift);              // family column, so pairs stay stacked
     tile.style.gridRow = String(slot.row);
     const stage = document.createElement("div");                      // the thing that rotates, the frame sits inside it
     stage.className = "nw-stage";
@@ -674,21 +726,22 @@ function buildWall(cams) {
 
   let infoBox = null;
   if (SHOW_STATUS_PANEL) {
-    const taken = {};
-    layout.placed.forEach(function (sl) { taken[sl.col + ":" + sl.row] = true; });
-    let slot = null;
-    for (let r = 1; r <= rows && !slot; r++) {
-      for (let c = 1; c <= cols && !slot; c++) { if (!taken[c + ":" + r]) slot = { col: c, row: r }; }
-    }
-    if (slot) {                                                       // only when the grid actually has a gap
+    {
       infoBox = document.createElement("div");
       infoBox.id = "nw-info";
-      infoBox.style.gridColumn = String(slot.col);
-      infoBox.style.gridRow = String(slot.row);
+      if (gapSlot) {
+        infoBox.style.gridColumn = String(gapSlot.col + colShift);
+        infoBox.style.gridRow = String(gapSlot.row);
+      } else {
+        infoBox.classList.add("nw-rail");                             // thin column down the left of the cameras
+        infoBox.style.gridColumn = "1";
+        infoBox.style.gridRow = "1 / -1";
+      }
       infoBox.innerHTML = "<div class='nw-sect'><h3>Running now</h3>" +
                           "<div class='nw-none'>checking...</div></div>";
       grid.appendChild(infoBox);
-      log("status panel placed at column " + slot.col + ", row " + slot.row);
+      log(gapSlot ? "status panel in the spare cell at column " + gapSlot.col + ", row " + gapSlot.row
+                  : "status panel as a " + STATUS_RAIL_W + "px rail, the grid has no spare cell");
     }
   }
 

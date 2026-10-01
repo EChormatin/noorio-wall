@@ -94,6 +94,12 @@ not just ones that start later. Running runs come from the experiment tracker sh
 three robot calendars, both read without signing in. It refreshes every three minutes. Set
 SHOW_STATUS_PANEL to false in `content.js` to leave the cell empty instead.
 
+## The status panel position
+
+When the camera families are uneven, so the grid has a spare cell, the panel goes in that cell.
+When every cell is full, it becomes a 270px rail down the left and the cameras take the rest of the
+width. Change STATUS_RAIL_W in `content.js` to make the rail wider or narrower.
+
 ## The chorylab.com bar
 
 A small bar sits in the bottom right corner reading "Learn more about our research at
