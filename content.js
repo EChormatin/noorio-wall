@@ -328,7 +328,8 @@ function buildWall(cams) {
     "opacity:0;transition:opacity .2s;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);}" +
     "#nw-grid .nw-move{bottom:46px;}" +
     "#nw-grid .nw-tile:hover .nw-rot,#nw-grid .nw-tile:hover .nw-move{opacity:1;}" +
-    "#nw-grid .nw-rot.nw-on,#nw-grid .nw-move.nw-on{opacity:1;color:#fff;border-color:#7fb2e5;}" +
+    "#nw-grid .nw-rot.nw-on,#nw-grid .nw-move.nw-on{color:#fff;border-color:#7fb2e5;}" +
+    "#nw-grid .nw-tile.nw-posing .nw-rot,#nw-grid .nw-tile.nw-posing .nw-move{opacity:1;}" +
     "#nw-grid .nw-tile.nw-lastcell .nw-rot{bottom:58px;}" +            // keep clear of the promo bar
     "#nw-grid .nw-tile.nw-lastcell .nw-move{bottom:94px;}" +
     "#nw-grid .nw-pad{position:absolute;inset:0;z-index:5;display:none;cursor:grab;" +
@@ -780,6 +781,7 @@ function buildWall(cams) {
     panes.forEach(function (q) { if (q !== p && q.moving) endMove(q); });   // one tile at a time
     if (p.moving) { endMove(p); return; }
     p.moving = true;
+    p.tile.classList.add("nw-posing");                                // keep Done reachable even without the pointer on it
     p.pad.classList.add("nw-on");
     p.move.classList.add("nw-on");
     p.move.textContent = "Done";
@@ -789,6 +791,7 @@ function buildWall(cams) {
 
   function endMove(p) {
     p.moving = false;
+    p.tile.classList.remove("nw-posing");
     p.pad.classList.remove("nw-on", "nw-drag");
     p.move.classList.toggle("nw-on", !!(p.panX || p.panY));
     p.move.textContent = (p.panX || p.panY) ? "Moved" : "Move";
