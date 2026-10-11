@@ -329,7 +329,7 @@ function buildWall(cams) {
     "#nw-grid .nw-move{bottom:46px;}" +
     "#nw-grid .nw-tile:hover .nw-rot,#nw-grid .nw-tile:hover .nw-move{opacity:1;}" +
     "#nw-grid .nw-rot.nw-on,#nw-grid .nw-move.nw-on{color:#fff;border-color:#7fb2e5;}" +
-    "#nw-grid .nw-tile.nw-posing .nw-rot,#nw-grid .nw-tile.nw-posing .nw-move{opacity:1;}" +
+    "#nw-grid .nw-tile.nw-posing .nw-move{opacity:1;}" +
     "#nw-grid .nw-tile.nw-lastcell .nw-rot{bottom:58px;}" +            // keep clear of the promo bar
     "#nw-grid .nw-tile.nw-lastcell .nw-move{bottom:94px;}" +
     "#nw-grid .nw-pad{position:absolute;inset:0;z-index:5;display:none;cursor:grab;" +
@@ -829,6 +829,10 @@ function buildWall(cams) {
     };
     p.pad.addEventListener("pointerup", drop);
     p.pad.addEventListener("pointercancel", drop);
+    p.pad.addEventListener("pointerleave", function () {              // walking away finishes the job
+      if (!p.moving || last) return;                                  // mid-drag, the capture will bring it back
+      endMove(p);
+    });
     p.pad.addEventListener("dblclick", function (e) {
       e.preventDefault();
       p.panX = 0; p.panY = 0; crop(p); savePan(p);
