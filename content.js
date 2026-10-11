@@ -51,6 +51,8 @@ const STATUS_REFRESH_MS = 180000; // re-ask the background for lab status every 
 const ICS_MAX_CHARS = 400000;     // only the tail of a calendar feed matters, and some are huge
 const STATUS_MAX_ROWS = 3;        // keep the panel small, it has to fit one tile
 const ROTATE_STORE = "nw-rotation";   // localStorage key holding {cameraName: degrees}
+const PAN_STORE = "nw-pan";           // and {cameraName: [x, y]}, each a fraction of the tile
+const PAN_STEP = 0.02;                // arrow-key nudge while a tile is being positioned
 const MUTE_ALL = true;            // mute every media element in every frame
 const CLICK_SOUND_BUTTON = true;  // also press Noorio's own speaker control so its icon shows muted
 const SOUND_CLICK_MAX = 2;        // cap, so a misread icon cannot toggle back and forth            // muted video may autoplay, unmuted may not
@@ -257,6 +259,16 @@ function layoutForCameras(cams) {
   return { cols: groups.length, rows: rows, placed: placed };
 }
 
+// A tile can be on its side, so a drag on screen has to be turned back into stage coordinates.
+// The stage is rotated by r, so the stage-space delta is the screen delta rotated by -r.
+function panDelta(rotation, dx, dy) {
+  const r = ((rotation % 360) + 360) % 360;
+  if (r === 90) return { x: dy, y: -dx };
+  if (r === 180) return { x: -dx, y: -dy };
+  if (r === 270) return { x: -dy, y: dx };
+  return { x: dx, y: dy };
+}
+
 function log() { if (DEBUG) console.log("[noorio-wall]", ...arguments); }
 
 function buildWall(cams) {
@@ -309,14 +321,24 @@ function buildWall(cams) {
     "text-transform:uppercase;font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:12.5px;" +
     "transition:opacity .4s;}" +
     "#nw-grid .nw-cover.nw-off{opacity:0;}" +
-    "#nw-grid .nw-rot{position:absolute;right:10px;bottom:10px;z-index:6;cursor:pointer;" +
+    "#nw-grid .nw-rot,#nw-grid .nw-move{position:absolute;right:10px;bottom:10px;z-index:6;cursor:pointer;" +
     "display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;" +
     "background:rgba(13,23,48,.68);border:1px solid rgba(255,255,255,.16);color:#dbe6f6;" +
     "font-family:'Jost','Century Gothic','Futura',sans-serif;font-size:12.5px;letter-spacing:.02em;" +
     "opacity:0;transition:opacity .2s;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);}" +
-    "#nw-grid .nw-tile:hover .nw-rot{opacity:1;}" +
-    "#nw-grid .nw-rot.nw-on{opacity:1;color:#fff;border-color:#7fb2e5;}" +
+    "#nw-grid .nw-move{bottom:46px;}" +
+    "#nw-grid .nw-tile:hover .nw-rot,#nw-grid .nw-tile:hover .nw-move{opacity:1;}" +
+    "#nw-grid .nw-rot.nw-on,#nw-grid .nw-move.nw-on{opacity:1;color:#fff;border-color:#7fb2e5;}" +
     "#nw-grid .nw-tile.nw-lastcell .nw-rot{bottom:58px;}" +            // keep clear of the promo bar
+    "#nw-grid .nw-tile.nw-lastcell .nw-move{bottom:94px;}" +
+    "#nw-grid .nw-pad{position:absolute;inset:0;z-index:5;display:none;cursor:grab;" +
+    "background:rgba(18,114,184,.08);box-shadow:inset 0 0 0 2px #7fb2e5;}" +
+    "#nw-grid .nw-pad.nw-on{display:block;}" +
+    "#nw-grid .nw-pad.nw-drag{cursor:grabbing;}" +
+    "#nw-grid .nw-padhint{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);" +
+    "padding:6px 13px;border-radius:999px;background:rgba(13,23,48,.82);color:#dbe6f6;" +
+    "border:1px solid rgba(255,255,255,.16);white-space:nowrap;pointer-events:none;" +
+    "font-family:\'Jost\',\'Century Gothic\',\'Futura\',sans-serif;font-size:12.5px;letter-spacing:.015em;}" +
     "#nw-promo{position:fixed;right:0;bottom:0;z-index:2147483647;display:flex;align-items:center;gap:9px;" +
     "padding:11px 18px;background:#16244d;color:#dbe6f6;text-decoration:none;" +
     "border-top:1px solid rgba(255,255,255,.14);border-left:1px solid rgba(255,255,255,.14);" +
@@ -325,7 +347,7 @@ function buildWall(cams) {
     "transition:background .25s,color .25s;}" +
     "#nw-promo:hover{background:#1c3160;color:#fff;}" +
     "#nw-promo .nw-mark{width:7px;height:7px;border-radius:50%;background:#7fb2e5;flex:none;}" +
-    "#nw-grid .nw-hud{position:absolute;left:14px;top:14px;z-index:5;display:flex;align-items:center;" +
+    "#nw-grid .nw-hud{position:absolute;left:14px;top:14px;z-index:5;pointer-events:none;display:flex;align-items:center;" +
     "gap:12px;padding:6px 22px 6px 6px;border-radius:999px;background:rgba(13,23,48,.74);" +
     "border:1px solid rgba(255,255,255,.16);box-shadow:0 6px 18px rgba(8,15,35,.4);" +
     "-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px);color:#fff;" +
@@ -461,17 +483,33 @@ function buildWall(cams) {
     rot.title = "Rotate this camera";
     rot.addEventListener("click", function (e) { e.stopPropagation(); rotatePane(name); });
 
+    const move = document.createElement("div");                       // drag the picture around inside the tile
+    move.className = "nw-move";
+    move.textContent = "Move";
+    move.title = "Drag the picture to reposition it";
+    move.addEventListener("click", function (e) { e.stopPropagation(); toggleMove(name); });
+
+    const pad = document.createElement("div");                        // catches the drag, the iframe would swallow it
+    pad.className = "nw-pad";
+    const padHint = document.createElement("div");
+    padHint.className = "nw-padhint";
+    padHint.textContent = "Drag to position \u00b7 arrows to nudge \u00b7 double-click to centre";
+    pad.appendChild(padHint);
+
     const cover = document.createElement("div");                      // hides Noorio's sidebar and account page while the tile comes up
     cover.className = "nw-cover";
     cover.textContent = "Starting camera";
 
     tile.appendChild(stage);
     tile.appendChild(cover);
+    tile.appendChild(pad);
     tile.appendChild(hud);
     tile.appendChild(rot);
+    tile.appendChild(move);
     grid.appendChild(tile);
     return { name: name, tile: tile, stage: stage, frame: frame, hud: hud, hudText: hudText, rot: rot,
-             cover: cover,
+             cover: cover, move: move, pad: pad,
+             panX: 0, panY: 0, moving: false,                         // position inside the tile, restored from storage
              rotation: 0,                                             // replaced by applySavedRotations once storage answers
              state: "loading",                                        // loading -> selecting -> starting -> live, retried on timeout
              turnStarted: Date.now(), cropped: false,
@@ -711,6 +749,90 @@ function buildWall(cams) {
     } catch (e) { log("could not read rotations", e && e.message); }
   }
 
+  function applySavedPans() {
+    try {
+      chrome.storage.local.get([PAN_STORE], function (got) {
+        const all = (got && got[PAN_STORE]) || {};
+        let any = false;
+        panes.forEach(function (p) {
+          const at = all[p.name];
+          if (at && at.length === 2) { p.panX = Number(at[0]) || 0; p.panY = Number(at[1]) || 0; any = true; }
+        });
+        if (any) { log("restored saved positions", all); panes.forEach(function (p) { crop(p); }); }
+      });
+    } catch (e) { log("could not read positions", e && e.message); }
+  }
+
+  function savePan(p) {
+    try {
+      chrome.storage.local.get([PAN_STORE], function (got) {
+        const all = (got && got[PAN_STORE]) || {};
+        if (p.panX || p.panY) all[p.name] = [p.panX, p.panY]; else delete all[p.name];
+        const payload = {}; payload[PAN_STORE] = all;
+        chrome.storage.local.set(payload, function () { log("saved position", p.name, p.panX, p.panY); });
+      });
+    } catch (e) { log("could not save position", e && e.message); }
+  }
+
+  function toggleMove(name) {
+    const p = panes.filter(function (x) { return x.name === name; })[0];
+    if (!p) return;
+    panes.forEach(function (q) { if (q !== p && q.moving) endMove(q); });   // one tile at a time
+    if (p.moving) { endMove(p); return; }
+    p.moving = true;
+    p.pad.classList.add("nw-on");
+    p.move.classList.add("nw-on");
+    p.move.textContent = "Done";
+    p.tile.setAttribute("tabindex", "-1");
+    log("positioning", p.name);
+  }
+
+  function endMove(p) {
+    p.moving = false;
+    p.pad.classList.remove("nw-on", "nw-drag");
+    p.move.classList.toggle("nw-on", !!(p.panX || p.panY));
+    p.move.textContent = (p.panX || p.panY) ? "Moved" : "Move";
+    savePan(p);
+  }
+
+  function nudge(p, dx, dy) {                                         // dx, dy are already in stage space
+    p.panX += dx; p.panY += dy;
+    crop(p);                                                          // crop clamps, and writes back what was reachable
+  }
+
+  function wireMove(p) {
+    let last = null;
+    p.pad.addEventListener("pointerdown", function (e) {
+      if (!p.moving) return;
+      last = { x: e.clientX, y: e.clientY };
+      p.pad.classList.add("nw-drag");
+      try { p.pad.setPointerCapture(e.pointerId); } catch (err) {}
+      e.preventDefault();
+    });
+    p.pad.addEventListener("pointermove", function (e) {
+      if (!p.moving || !last) return;
+      const d = panDelta(p.rotation, e.clientX - last.x, e.clientY - last.y);
+      last = { x: e.clientX, y: e.clientY };
+      const dims = layoutStage(p);
+      nudge(p, d.x / Math.max(1, dims.w), d.y / Math.max(1, dims.h));
+      e.preventDefault();
+    });
+    const drop = function (e) {
+      if (!last) return;
+      last = null;
+      p.pad.classList.remove("nw-drag");
+      savePan(p);                                                     // keep it across reloads
+      if (e) e.preventDefault();
+    };
+    p.pad.addEventListener("pointerup", drop);
+    p.pad.addEventListener("pointercancel", drop);
+    p.pad.addEventListener("dblclick", function (e) {
+      e.preventDefault();
+      p.panX = 0; p.panY = 0; crop(p); savePan(p);
+      log("centred", p.name);
+    });
+  }
+
   function saveRotation(name, deg) {
     try {
       chrome.storage.local.get([ROTATE_STORE], function (got) {
@@ -785,8 +907,13 @@ function buildWall(cams) {
     let left = -vx * s + (FIT === "cover" ? (tw - vw * s) / 2 : 0);
     let top = -vy * s + (FIT === "cover" ? (th - vh * s) / 2 : 0);
     if (FIT === "cover") {                                            // never let an edge of the frame come inside the tile
+      const baseLeft = left, baseTop = top;
+      left += (p.panX || 0) * tw;                                     // where this camera has been dragged to
+      top += (p.panY || 0) * th;
       left = Math.min(0, Math.max(left, tw - fw * s));
       top = Math.min(0, Math.max(top, th - fh * s));
+      p.panX = (left - baseLeft) / tw;                                // hold only what the picture can actually give
+      p.panY = (top - baseTop) / th;
     }
 
     p.frame.style.transform = "scale(" + s + ")";
@@ -1195,7 +1322,8 @@ function buildWall(cams) {
     ["B", "Hide or show this header"],
     ["L", "Hide or show camera labels"],
     ["R", "Restart all cameras"],
-    ["D", "Diagnostics"]
+    ["D", "Diagnostics"],
+    ["\u2190\u2191\u2192\u2193", "Nudge a tile while positioning it"]
   ];
 
   function toggleKeys() {
@@ -1258,6 +1386,17 @@ function buildWall(cams) {
 
   document.addEventListener("keydown", function (e) {
     const k = e.key.toLowerCase();
+    const positioning = panes.filter(function (q) { return q.moving; })[0];
+    if (positioning) {                                                // arrows nudge the tile being positioned
+      const step = e.shiftKey ? PAN_STEP * 4 : PAN_STEP;
+      const by = { arrowleft: [-step, 0], arrowright: [step, 0], arrowup: [0, -step], arrowdown: [0, step] }[k];
+      if (by) {
+        const d = panDelta(positioning.rotation, by[0], by[1]);
+        nudge(positioning, d.x, d.y); savePan(positioning);
+        e.preventDefault(); return;
+      }
+      if (e.key === "Escape" || e.key === "Enter") { endMove(positioning); e.preventDefault(); return; }
+    }
     if (e.key === "Escape" && document.getElementById("nw-keys")) { toggleKeys(); return; }
     if (e.key === "?" || k === "h") { toggleKeys(); return; }
     if (k === "d") diagnose();
@@ -1283,6 +1422,8 @@ function buildWall(cams) {
 
   panes.forEach(layoutStage);
   applySavedRotations();                                              // bring back each camera's saved angle
+  applySavedPans();                                                   // and where each one was dragged to
+  panes.forEach(wireMove);
 
   NW_TIMERS.forEach(clearInterval);                                   // a rebuild must not leave the old loops running
   NW_TIMERS.length = 0;
